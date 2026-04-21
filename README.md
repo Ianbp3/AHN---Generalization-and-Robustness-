@@ -216,11 +216,7 @@ Las regiones con error alto relativo al anterior reciben un límite mayor (más 
 
 ### 3.3. Multi-Restart
 
-El entrenamiento completo se repite `n_restarts` veces con seeds distintas. Se conserva el compuesto con menor `best_E_`:
-
-$$\text{seed}_{\text{restart}} = \text{random\_state} + i + \text{restart} \times c$$
-
-La selección usa `comp.best_E_` (mínimo histórico restaurado), **no** `comp.history[-1]` (última iteración), que podría ser mayor por la exploración posterior.
+El entrenamiento completo se repite `n_restarts` veces con seeds distintas. Se conserva el compuesto con menor `best_E_`.
 
 ---
 
