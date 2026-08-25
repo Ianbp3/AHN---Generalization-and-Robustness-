@@ -11,8 +11,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, roc_curve, confusion_matrix, classification_report
+    roc_auc_score, average_precision_score, roc_curve, confusion_matrix,
+    classification_report
 )
+from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
@@ -396,7 +398,63 @@ class AHNMixture:
         return np.column_stack([1 - prob, prob])
 
     def predict(self, X):
+        # Uses the calibrated probability once fit_platt() has been called, so
+        # AHN's hard labels (and therefore Accuracy/Precision/Recall/F1) are
+        # consistent with its own stated calibration step, and directly
+        # comparable to CalibratedBaseline.predict() below. Falls back to the
+        # raw uncalibrated score only if fit_platt() was never called.
+        if self.platt_a is not None:
+            prob = self.predict_proba(X)[:, 1]
+            return (prob >= self.threshold).astype(int)
         return (self.predict_raw(X) >= self.threshold).astype(int)
+
+
+class CalibratedBaseline:
+    """
+    Wraps a fitted sklearn classifier (SVM, RF, MLP) with a post-hoc Platt/
+    logistic calibrator fit on the model's own raw decision score, using the
+    exact same protocol as AHNMixture.fit_platt: a 1-D logistic regression of
+    y_val on the raw score, evaluated only on the held-out validation set.
+
+    "Raw score" = decision_function(X) when available (SVM's signed margin),
+    otherwise the model's native predict_proba(X)[:, 1] (RF, MLP), which plays
+    the same role AHN's predict_raw(X) plays for AHNMixture.
+
+    predict() thresholds the CALIBRATED probability at 0.5 (not the model's
+    own internal .predict(), which for some sklearn estimators — notably SVC —
+    can use a different internal decision rule than predict_proba). This gives
+    every model in the comparison the same calibration procedure and the same
+    definition of "0.5 threshold" for Accuracy/Precision/Recall/F1.
+    """
+
+    def __init__(self, base_model, threshold=0.5):
+        self.base_model = base_model
+        self.threshold  = threshold
+        self.platt_a    = None
+        self.platt_b    = None
+
+    def _raw_score(self, X):
+        if hasattr(self.base_model, 'decision_function'):
+            return self.base_model.decision_function(X)
+        return self.base_model.predict_proba(X)[:, 1]
+
+    def fit_platt(self, X_val, y_val):
+        raw = self._raw_score(X_val).reshape(-1, 1)
+        lr  = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
+        lr.fit(raw, y_val)
+        self.platt_a = float(lr.coef_[0, 0])
+        self.platt_b = float(lr.intercept_[0])
+        return self
+
+    def predict_proba(self, X):
+        raw   = self._raw_score(X)
+        logit = (self.platt_a * raw + self.platt_b) if self.platt_a is not None else raw
+        prob  = 1.0 / (1.0 + np.exp(-logit))
+        return np.column_stack([1 - prob, prob])
+
+    def predict(self, X):
+        prob = self.predict_proba(X)[:, 1]
+        return (prob >= self.threshold).astype(int)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -522,12 +580,14 @@ ahn_results = {
     'recall':    recall_score(y_test,    y_pred_ahn, zero_division=0),
     'f1':        f1_score(y_test,        y_pred_ahn, zero_division=0),
     'roc_auc':   roc_auc_score(y_test,   y_proba_ahn),
+    'avg_precision': average_precision_score(y_test, y_proba_ahn),
     'y_pred':    y_pred_ahn,
     'y_proba':   y_proba_ahn,
     'confusion_matrix': confusion_matrix(y_test, y_pred_ahn),
 }
 print(f"\nAHN: Acc={ahn_results['test_acc']:.4f}, "
       f"F1={ahn_results['f1']:.4f}, "
+      f"AUC-PR={ahn_results['avg_precision']:.4f}, "
       f"ROC-AUC={ahn_results['roc_auc']:.4f}")
 
 
@@ -547,12 +607,12 @@ kf       = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
 X_cv     = np.vstack([X_train, X_val])   # usamos todo lo que no es test
 y_cv     = np.concatenate([y_train, y_val])
 
-cv_aucs, cv_accs, cv_f1s = [], [], []
+cv_aucs, cv_accs, cv_f1s, cv_aps = [], [], [], []
 
 print(f"\n{'─'*70}")
 print(f"K-FOLD CROSS VALIDATION  (K={K_FOLDS}, StratifiedKFold, datos=train+val)")
 print(f"{'─'*70}")
-print(f"  {'Fold':>5}  {'AUC':>7}  {'ACC':>7}  {'F1':>7}  Platt (a, b)")
+print(f"  {'Fold':>5}  {'AUC':>7}  {'AUC-PR':>7}  {'ACC':>7}  {'F1':>7}  Platt (a, b)")
 
 for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cv, y_cv), 1):
     X_tr, X_ho = X_cv[tr_idx], X_cv[val_idx]
@@ -574,17 +634,19 @@ for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cv, y_cv), 1):
     yp   = m.predict(X_ho)
     ypr  = m.predict_proba(X_ho)[:, 1]
     auc  = roc_auc_score(y_ho, ypr)
+    ap   = average_precision_score(y_ho, ypr)
     acc  = accuracy_score(y_ho, yp)
     f1   = f1_score(y_ho, yp, zero_division=0)
-    cv_aucs.append(auc); cv_accs.append(acc); cv_f1s.append(f1)
-    print(f"  {fold:>5}  {auc:.4f}   {acc:.4f}   {f1:.4f}   "
+    cv_aucs.append(auc); cv_accs.append(acc); cv_f1s.append(f1); cv_aps.append(ap)
+    print(f"  {fold:>5}  {auc:.4f}   {ap:.4f}   {acc:.4f}   {f1:.4f}   "
           f"a={m.platt_a:.3f}  b={m.platt_b:.3f}")
 
 print(f"{'─'*70}")
-print(f"  {'Media':>5}  {np.mean(cv_aucs):.4f}   {np.mean(cv_accs):.4f}   {np.mean(cv_f1s):.4f}")
-print(f"  {'±std':>5}  {np.std(cv_aucs):.4f}   {np.std(cv_accs):.4f}   {np.std(cv_f1s):.4f}")
+print(f"  {'Media':>5}  {np.mean(cv_aucs):.4f}   {np.mean(cv_aps):.4f}   {np.mean(cv_accs):.4f}   {np.mean(cv_f1s):.4f}")
+print(f"  {'±std':>5}  {np.std(cv_aucs):.4f}   {np.std(cv_aps):.4f}   {np.std(cv_accs):.4f}   {np.std(cv_f1s):.4f}")
 print(f"  [Test real AHN final: "
       f"AUC={ahn_results['roc_auc']:.4f}  "
+      f"AUC-PR={ahn_results['avg_precision']:.4f}  "
       f"ACC={ahn_results['test_acc']:.4f}  "
       f"F1={ahn_results['f1']:.4f}]")
 
@@ -610,26 +672,37 @@ baseline_models = {
     ),
 }
 
-baseline_results = {}
+baseline_results      = {}
+calibrated_baselines  = {}   # kept for reuse in robustness experiments if needed
 for name, model in baseline_models.items():
     model.fit(X_train, y_train)
-    y_pred  = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+
+    # Uniform calibration: same Platt procedure as AHN, fit on the same
+    # validation set. Hard labels now come from the calibrated probability
+    # for every model, not from each estimator's own internal decision rule.
+    cal = CalibratedBaseline(model).fit_platt(X_val, y_val)
+    calibrated_baselines[name] = cal
+
+    y_pred  = cal.predict(X_test)
+    y_proba = cal.predict_proba(X_test)[:, 1]
     baseline_results[name] = {
-        'train_acc': accuracy_score(y_train, model.predict(X_train)),
-        'val_acc':   accuracy_score(y_val,   model.predict(X_val)),
+        'train_acc': accuracy_score(y_train, cal.predict(X_train)),
+        'val_acc':   accuracy_score(y_val,   cal.predict(X_val)),
         'test_acc':  accuracy_score(y_test,  y_pred),
         'precision': precision_score(y_test, y_pred, zero_division=0),
         'recall':    recall_score(y_test,    y_pred, zero_division=0),
         'f1':        f1_score(y_test,        y_pred, zero_division=0),
         'roc_auc':   roc_auc_score(y_test,   y_proba),
+        'avg_precision': average_precision_score(y_test, y_proba),
         'y_pred':    y_pred,
         'y_proba':   y_proba,
         'confusion_matrix': confusion_matrix(y_test, y_pred),
     }
     print(f"  {name}: Acc={baseline_results[name]['test_acc']:.4f}, "
           f"F1={baseline_results[name]['f1']:.4f}, "
-          f"ROC-AUC={baseline_results[name]['roc_auc']:.4f}")
+          f"AUC-PR={baseline_results[name]['avg_precision']:.4f}, "
+          f"ROC-AUC={baseline_results[name]['roc_auc']:.4f}  "
+          f"(Platt a={cal.platt_a:.3f}, b={cal.platt_b:.3f})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -646,11 +719,13 @@ for name, res in baseline_results.items():
                  'Train Acc': res['train_acc'], 'Val Acc': res['val_acc'],
                  'Test Acc':  res['test_acc'],  'Precision': res['precision'],
                  'Recall':    res['recall'],    'F1-Score':  res['f1'],
+                 'Avg Precision (AUC-PR)': res['avg_precision'],
                  'ROC-AUC':   res['roc_auc']})
 rows.append({'Model': 'AHN', 'Type': 'AHN',
              'Train Acc': ahn_results['train_acc'], 'Val Acc': ahn_results['val_acc'],
              'Test Acc':  ahn_results['test_acc'],  'Precision': ahn_results['precision'],
              'Recall':    ahn_results['recall'],    'F1-Score':  ahn_results['f1'],
+             'Avg Precision (AUC-PR)': ahn_results['avg_precision'],
              'ROC-AUC':   ahn_results['roc_auc']})
 
 comparison_df = (pd.DataFrame(rows)
@@ -863,7 +938,7 @@ print("=" * 70)
 
 print("\nRANKING POR METRICA:")
 print("-" * 70)
-for metric in ['Test Acc', 'F1-Score', 'ROC-AUC']:
+for metric in ['Test Acc', 'F1-Score', 'Avg Precision (AUC-PR)', 'ROC-AUC']:
     ranked = comparison_df.sort_values(metric, ascending=False)
     print(f"\n{metric}:")
     for rank, (_, row) in enumerate(ranked.iterrows(), 1):
@@ -889,6 +964,7 @@ print(f"  ROC-AUC  : {best['ROC-AUC']:.4f}")
 b_df  = comparison_df[comparison_df['Type'] == 'Baseline']
 b_acc = b_df['Test Acc'].mean()
 b_f1  = b_df['F1-Score'].mean()
+b_ap  = b_df['Avg Precision (AUC-PR)'].mean()
 b_roc = b_df['ROC-AUC'].mean()
 
 print("\n" + "=" * 70)
@@ -899,6 +975,8 @@ print(f"\n  Accuracy : AHN {ahn_results['test_acc']:.4f}  vs  Baseline {b_acc:.4
       f"({'UP' if ahn_results['test_acc'] >= b_acc else 'DOWN'} {abs(ahn_results['test_acc']-b_acc):.4f})")
 print(f"  F1-Score : AHN {ahn_results['f1']:.4f}  vs  Baseline {b_f1:.4f}  "
       f"({'UP' if ahn_results['f1'] >= b_f1 else 'DOWN'} {abs(ahn_results['f1']-b_f1):.4f})")
+print(f"  AUC-PR   : AHN {ahn_results['avg_precision']:.4f}  vs  Baseline {b_ap:.4f}  "
+      f"({'UP' if ahn_results['avg_precision'] >= b_ap else 'DOWN'} {abs(ahn_results['avg_precision']-b_ap):.4f})")
 print(f"  ROC-AUC  : AHN {ahn_results['roc_auc']:.4f}  vs  Baseline {b_roc:.4f}  "
       f"({'UP' if ahn_results['roc_auc'] >= b_roc else 'DOWN'} {abs(ahn_results['roc_auc']-b_roc):.4f})")
 
@@ -937,8 +1015,8 @@ _PALETTE = {
 _MARKERS = {'AHN': 'o', 'SVM': 's', 'Random Forest': '^', 'MLP': 'D'}
 _LW      = {'AHN': 2.5, 'SVM': 1.8, 'Random Forest': 1.8, 'MLP': 1.8}
 _MODELS  = ['AHN', 'SVM', 'Random Forest', 'MLP']
-_METRICS = ['acc', 'precision', 'recall', 'f1', 'auc']
-_MLABELS = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'ROC-AUC']
+_METRICS = ['acc', 'precision', 'recall', 'f1', 'ap', 'auc']
+_MLABELS = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'AUC-PR', 'ROC-AUC']
 
 _AHN_SWEEP = {k: v for k, v in AHN_CONFIG.items()}
 _AHN_SWEEP['n_restarts']     = 1
@@ -963,33 +1041,39 @@ def _eval_all(X_tr, y_tr, X_te, y_te, ahn_seed=42):
     cfg = {**_AHN_SWEEP, 'random_state': ahn_seed}
     _ahn = AHNMixture(**cfg)
     _ahn.fit(X_tr, y_tr)
-    _ahn.fit_platt(X_val, y_val)
-    yp  = _ahn.predict(X_te)
+    _ahn.fit_platt(X_val, y_val)          # calibrated on the fixed validation set
+    yp  = _ahn.predict(X_te)              # now uses the calibrated probability
     ypr = _ahn.predict_proba(X_te)[:, 1]
     results['AHN'] = {
         'acc':       accuracy_score(y_te, yp),
         'precision': precision_score(y_te, yp, zero_division=0),
         'recall':    recall_score(y_te, yp, zero_division=0),
         'f1':        f1_score(y_te, yp, zero_division=0),
+        'ap':        average_precision_score(y_te, ypr),
         'auc':       roc_auc_score(y_te, ypr),
     }
 
     for name, model in _fresh_baselines().items():
         model.fit(X_tr, y_tr)
-        yp  = model.predict(X_te)
-        ypr = model.predict_proba(X_te)[:, 1]
+        # Same Platt protocol as AHN, fit on the same fixed validation set —
+        # ensures every model in the sweep shares one calibration procedure
+        # and one definition of the 0.5 operating point.
+        cal = CalibratedBaseline(model).fit_platt(X_val, y_val)
+        yp  = cal.predict(X_te)
+        ypr = cal.predict_proba(X_te)[:, 1]
         results[name] = {
             'acc':       accuracy_score(y_te, yp),
             'precision': precision_score(y_te, yp, zero_division=0),
             'recall':    recall_score(y_te, yp, zero_division=0),
             'f1':        f1_score(y_te, yp, zero_division=0),
+            'ap':        average_precision_score(y_te, ypr),
             'auc':       roc_auc_score(y_te, ypr),
         }
     return results
 
 def _plot_robustness(x_vals, df, x_col, x_labels, xlabel, title, fname,
                      highlight_ref=None):
-    fig, axes = plt.subplots(1, 5, figsize=(22, 5))
+    fig, axes = plt.subplots(1, 6, figsize=(26, 5))
     fig.suptitle(title, fontsize=12, fontweight='bold', y=1.02)
 
     for ax, met, mlbl in zip(axes, _METRICS, _MLABELS):
@@ -1093,14 +1177,17 @@ print("=" * 70)
 print("  Entrenar con X_train limpio  |  Ruido N(0,σ) añadido a X_test")
 print(f"  σ: {NOISE_SIGMAS}  (escala escalada [-1,1])\n")
 
-# Entrenar una sola vez en limpio
+# Entrenar una sola vez en limpio, calibrar una sola vez en validación limpia
+# (misma disciplina para AHN y para los tres baselines)
 _ahn_fn = AHNMixture(**_AHN_SWEEP)
 _ahn_fn.fit(X_train, y_train)
 _ahn_fn.fit_platt(X_val, y_val)
 
-_bl_fn = _fresh_baselines()
-for _m in _bl_fn.values():
+_bl_fn_raw = _fresh_baselines()
+_bl_fn     = {}
+for _name, _m in _bl_fn_raw.items():
     _m.fit(X_train, y_train)
+    _bl_fn[_name] = CalibratedBaseline(_m).fit_platt(X_val, y_val)
 
 fn_rows  = []
 _rng_fn  = np.random.default_rng(0)
@@ -1116,16 +1203,18 @@ for sigma in NOISE_SIGMAS:
         'precision': precision_score(y_test, yp, zero_division=0),
         'recall':    recall_score(y_test, yp, zero_division=0),
         'f1':        f1_score(y_test, yp, zero_division=0),
+        'ap':        average_precision_score(y_test, ypr),
         'auc':       roc_auc_score(y_test, ypr),
     }
-    for name, model in _bl_fn.items():
-        yp  = model.predict(X_te_n)
-        ypr = model.predict_proba(X_te_n)[:, 1]
+    for name, cal in _bl_fn.items():
+        yp  = cal.predict(X_te_n)
+        ypr = cal.predict_proba(X_te_n)[:, 1]
         res[name] = {
             'acc':       accuracy_score(y_test, yp),
             'precision': precision_score(y_test, yp, zero_division=0),
             'recall':    recall_score(y_test, yp, zero_division=0),
             'f1':        f1_score(y_test, yp, zero_division=0),
+            'ap':        average_precision_score(y_test, ypr),
             'auc':       roc_auc_score(y_test, ypr),
         }
 
@@ -1213,25 +1302,35 @@ print("=" * 70)
 def _get(df, m, met, x_col, x_val):
     return df[(df.model == m) & (df[x_col] == x_val)][met].values[0]
 
-print(f"\n  {'Experimento':<24}  {'Modelo':<16}  {'AUC limpio':>10}  {'AUC extremo':>11}  {'ΔAUC':>7}")
-print("  " + "-" * 74)
+print(f"\n  {'Experimento':<24}  {'Modelo':<16}  {'AUC limpio':>10}  {'AUC extremo':>11}  {'ΔAUC':>7}"
+      f"  {'AP limpio':>9}  {'AP extremo':>10}  {'ΔAP':>7}")
+print("  " + "-" * 100)
 
 for m in _MODELS:
     a_c = _get(sc_df, m, 'auc', 'fraction', 1.00)
     a_e = _get(sc_df, m, 'auc', 'fraction', 0.05)
-    print(f"  {'Scarcity (5%→100%)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}")
+    p_c = _get(sc_df, m, 'ap', 'fraction', 1.00)
+    p_e = _get(sc_df, m, 'ap', 'fraction', 0.05)
+    print(f"  {'Scarcity (5%→100%)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}"
+          f"  {p_c:>9.4f}  {p_e:>10.4f}  {p_e-p_c:>+7.4f}")
 
 print()
 for m in _MODELS:
     a_c = _get(fn_df, m, 'auc', 'sigma', 0.0)
     a_e = _get(fn_df, m, 'auc', 'sigma', 1.0)
-    print(f"  {'Feature Noise (σ=1.0)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}")
+    p_c = _get(fn_df, m, 'ap', 'sigma', 0.0)
+    p_e = _get(fn_df, m, 'ap', 'sigma', 1.0)
+    print(f"  {'Feature Noise (σ=1.0)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}"
+          f"  {p_c:>9.4f}  {p_e:>10.4f}  {p_e-p_c:>+7.4f}")
 
 print()
 for m in _MODELS:
     a_c = _get(ln_df, m, 'auc', 'flip_rate', 0.00)
     a_e = _get(ln_df, m, 'auc', 'flip_rate', 0.20)
-    print(f"  {'Label Noise (20% flip)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}")
+    p_c = _get(ln_df, m, 'ap', 'flip_rate', 0.00)
+    p_e = _get(ln_df, m, 'ap', 'flip_rate', 0.20)
+    print(f"  {'Label Noise (20% flip)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}"
+          f"  {p_c:>9.4f}  {p_e:>10.4f}  {p_e-p_c:>+7.4f}")
 
 print("\n" + "=" * 70)
 print("EXPERIMENTOS DE ROBUSTEZ FINALIZADOS  [Exoplanetas KOI]")
