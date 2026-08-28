@@ -88,6 +88,7 @@ class AHNCompound:
         self.molecules = []
         self.L = self.r = self.L_min = self.L_max = self.centers = None
         self.history = []
+        self.pc1_explained_variance_ratio_ = None   # set in _init_bounds when m > 1
 
     # ── Inicialización de bounds ───────────────────────────────────────────────
 
@@ -99,11 +100,16 @@ class AHNCompound:
             X_c = X - X.mean(axis=0)
 
             try:
-                _, _, Vt = np.linalg.svd(X_c, full_matrices=False)
+                _, S, Vt = np.linalg.svd(X_c, full_matrices=False)
                 self._chain_axis = Vt[0]
+                total_var = float(np.sum(S ** 2))
+                self.pc1_explained_variance_ratio_ = (
+                    float(S[0] ** 2 / total_var) if total_var > 0 else 0.0
+                )
             except np.linalg.LinAlgError:
                 self._chain_axis = np.zeros(self.n_feat)
                 self._chain_axis[np.argmax(X.var(axis=0))] = 1.0
+                self.pc1_explained_variance_ratio_ = None
 
             X_proj = X @ self._chain_axis
             p_min, p_max = X_proj.min(), X_proj.max()
@@ -532,6 +538,56 @@ print(f"Features: {X_train.shape[1]}")
 print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
 print(f"Balance test — Confirmed: {(y_test==1).sum()}, False Positive: {(y_test==0).sum()}")
 
+# ── RESUMEN DEL DATASET  (Reviewer #1: N, class ratio, feature names) ────────
+print("\n" + "=" * 70)
+print("RESUMEN DEL DATASET  (para Sección III-A del paper)")
+print("=" * 70)
+print(f"  Fuente de datos        : {DATA_SOURCE}")
+print(f"  N total (tras dropna)  : {len(X_array)}")
+print(f"  Balance global         : Confirmed={int((y==1).sum())} ({(y==1).mean():.1%})   "
+      f"False Positive={int((y==0).sum())} ({(y==0).mean():.1%})")
+print(f"  N train / val / test   : {len(X_train)} / {len(X_val)} / {len(X_test)}")
+print(f"  Balance train          : Confirmed={int((y_train==1).sum())} ({(y_train==1).mean():.1%})   "
+      f"False Positive={int((y_train==0).sum())} ({(y_train==0).mean():.1%})")
+print(f"  Balance test           : Confirmed={int((y_test==1).sum())} ({(y_test==1).mean():.1%})   "
+      f"False Positive={int((y_test==0).sum())} ({(y_test==0).mean():.1%})")
+print(f"  Features ({len(FEATURES)})       : {', '.join(FEATURES)}")
+
+pd.DataFrame([{
+    'data_source': DATA_SOURCE, 'n_total': len(X_array),
+    'n_confirmed': int((y==1).sum()), 'n_false_positive': int((y==0).sum()),
+    'n_train': len(X_train), 'n_val': len(X_val), 'n_test': len(X_test),
+    'n_features': len(FEATURES), 'features': ';'.join(FEATURES),
+}]).to_csv(out('dataset_summary.csv'), index=False)
+print("  Guardado: dataset_summary.csv")
+
+# ── CONTROL: clasificador trivial "todo positivo"  (Reviewer #1) ─────────────
+# Distingue una ventaja de robustez genuina de un modelo que simplemente
+# degenera hacia la clase positiva. Sus métricas dependen solo del balance de
+# y_test/y_train/y_val (nunca de X), por lo que son idénticas en el
+# experimento principal y en los tres escenarios de robustez: ninguno de ellos
+# modifica el balance de clases de test.
+def _all_positive_metrics(y_true):
+    pred = np.ones_like(y_true)
+    return {
+        'acc':       accuracy_score(y_true, pred),
+        'precision': precision_score(y_true, pred, zero_division=0),
+        'recall':    recall_score(y_true, pred, zero_division=0),   # = 1.0 por construcción
+        'f1':        f1_score(y_true, pred, zero_division=0),
+        'ap':        float((y_true == 1).mean()),  # AP de un score constante = prevalencia positiva
+        'auc':       0.5,                           # ROC-AUC de un score constante = 0.5 por definición
+    }
+
+ALL_POSITIVE_CONTROL = {
+    'train_acc': _all_positive_metrics(y_train)['acc'],
+    'val_acc':   _all_positive_metrics(y_val)['acc'],
+    **_all_positive_metrics(y_test),
+}
+print(f"\nControl (All-Positive): Acc={ALL_POSITIVE_CONTROL['acc']:.4f}, "
+      f"Precision={ALL_POSITIVE_CONTROL['precision']:.4f}, Recall={ALL_POSITIVE_CONTROL['recall']:.4f}, "
+      f"F1={ALL_POSITIVE_CONTROL['f1']:.4f}  "
+      f"(referencia fija: ignora X, no cambia con ruido/escasez)")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BLOQUE 3 — ENTRENAR AHN
@@ -563,8 +619,54 @@ print(f"Estructura: {_struct}  |  eta={AHN_CONFIG['learning_rate']}  "
       f"|  eps={AHN_CONFIG['tolerance']}  |  max_iter={AHN_CONFIG['max_iterations']}  "
       f"|  bias={AHN_CONFIG['use_bias']}  |  bce={AHN_CONFIG['use_bce']}")
 
+# ── Construcción unificada y semillada de baselines ───────────────────────────
+# Un único punto de verdad para los hiperparámetros de SVM/RF/MLP, usado por el
+# experimento principal, la CV y los tres barridos de robustez (antes había
+# tres copias separadas que podían divergir). Aceptar `seed` es lo que permite
+# las corridas multi-semilla del Bloque 8 en adelante.
+#
+# Manejo de desbalance de clases (Reviewer #2 — "unificar o justificar"):
+#   Ningún modelo recibe tratamiento especial por desbalance de clases. La
+#   versión original solo pesaba SVM (class_weight='balanced'); una versión
+#   intermedia intentó "igualar" el tratamiento dándole a RF su propio
+#   class_weight='balanced' nativo y a MLP un oversampling por frecuencia
+#   inversa como sustituto (MLPClassifier.fit() no acepta sample_weight ni
+#   class_weight). Se descartó esa vía: el oversampling de MLP no es en
+#   realidad el mismo mecanismo que el reweighting de SVM/RF, así que
+#   "igualar" mecanismos distintos seguía dejando una asimetría real, solo
+#   menos visible. La opción más simple y más defendible es la otra rama que
+#   ofrece el reviewer — unificar quitándolo en vez de añadiéndolo — de modo
+#   que los cuatro modelos (incluido AHN, que nunca tuvo ningún mecanismo de
+#   este tipo) se entrenan exactamente igual frente al desbalance de clases:
+#   ninguno.
+def make_baselines(seed=42):
+    return {
+        'SVM': SVC(kernel='rbf', probability=True, random_state=seed),
+        'Random Forest': RandomForestClassifier(
+            n_estimators=100, max_depth=10, min_samples_split=5,
+            random_state=seed),
+        'MLP': MLPClassifier(
+            hidden_layer_sizes=(64, 32), activation='relu', solver='adam',
+            alpha=0.001, learning_rate_init=0.001, max_iter=300,
+            early_stopping=True, validation_fraction=0.15, random_state=seed),
+    }
+
+def fit_baseline(name, model, X, y, rng=None):
+    """Fits a baseline. Kept as the single entry point used by every call site
+    (main experiment, CV, all three robustness sweeps) so nothing else needs
+    to change if a per-model mechanism is ever reintroduced. `rng` is accepted
+    for call-site compatibility but currently unused — no model gets special
+    imbalance handling."""
+    model.fit(X, y)
+    return model
+
 ahn = AHNMixture(**AHN_CONFIG)
 ahn.fit(X_train, y_train, verbose=True)
+
+_pc1_var = ahn.compounds[0].pc1_explained_variance_ratio_
+if _pc1_var is not None:
+    print(f"\nVarianza explicada por la 1a componente principal "
+          f"(PCA, partición por cuantiles): {_pc1_var:.4f}  ({_pc1_var*100:.2f}%)")
 
 ahn.fit_platt(X_val, y_val)
 print(f"Platt Scaling ajustado:  a={ahn.platt_a:.4f}  b={ahn.platt_b:.4f}")
@@ -591,13 +693,15 @@ print(f"\nAHN: Acc={ahn_results['test_acc']:.4f}, "
       f"ROC-AUC={ahn_results['roc_auc']:.4f}")
 
 
-# ── BLOQUE 3b — K-FOLD CROSS VALIDATION  ─────────────────────────────────────
-# Evalúa la estabilidad del modelo sobre distintos splits de X_train.
-# En cada fold:
-#   1. AHN.fit()       → train fold  (K-1 partes)
-#   2. fit_platt()     → 20% interno del train fold  (anti-leakage estricto)
-#   3. Evaluación      → held-out fold
-# El modelo final (entrenado arriba sobre X_train completo) no cambia.
+# ── BLOQUE 3b — K-FOLD CROSS VALIDATION  (LOS 4 MODELOS) ─────────────────────
+# Reviewer #2: reportar CV con media y desviación estándar por modelo y
+# métrica, como evidencia de que AHN, SVM, RF y MLP son comparables.
+#
+# Los 4 modelos comparten exactamente los mismos folds de StratifiedKFold, y
+# cada fold reserva un 20% interno de su porción de entrenamiento solo para
+# calibración Platt (nunca visto por el ajuste del modelo ni por el fold de
+# evaluación) — la misma disciplina anti-leakage ya usada para AHN, ahora
+# aplicada de forma uniforme a los tres baselines también.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from sklearn.model_selection import StratifiedKFold
@@ -607,48 +711,70 @@ kf       = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
 X_cv     = np.vstack([X_train, X_val])   # usamos todo lo que no es test
 y_cv     = np.concatenate([y_train, y_val])
 
-cv_aucs, cv_accs, cv_f1s, cv_aps = [], [], [], []
+_CV_MODELS  = ['AHN', 'SVM', 'Random Forest', 'MLP']
+_CV_METRICS = ['auc', 'ap', 'acc', 'f1']   # must match the printed header order: AUC | AUC-PR | ACC | F1
+cv_scores   = {m: {met: [] for met in _CV_METRICS} for m in _CV_MODELS}
 
-print(f"\n{'─'*70}")
-print(f"K-FOLD CROSS VALIDATION  (K={K_FOLDS}, StratifiedKFold, datos=train+val)")
-print(f"{'─'*70}")
-print(f"  {'Fold':>5}  {'AUC':>7}  {'AUC-PR':>7}  {'ACC':>7}  {'F1':>7}  Platt (a, b)")
+print(f"\n{'─'*78}")
+print(f"K-FOLD CROSS VALIDATION  (K={K_FOLDS}, StratifiedKFold, datos=train+val, 4 modelos)")
+print(f"{'─'*78}")
+print(f"  {'Fold':>5}  {'Modelo':<16}  {'AUC':>7}  {'AUC-PR':>7}  {'ACC':>7}  {'F1':>7}")
 
 for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cv, y_cv), 1):
     X_tr, X_ho = X_cv[tr_idx], X_cv[val_idx]
     y_tr, y_ho = y_cv[tr_idx], y_cv[val_idx]
 
     # Split interno para Platt — 20% del train fold, nunca del held-out
-    n_platt      = max(20, int(0.20 * len(X_tr)))
-    X_platt      = X_tr[-n_platt:]
-    y_platt      = y_tr[-n_platt:]
-    X_tr_pure    = X_tr[:-n_platt]
-    y_tr_pure    = y_tr[:-n_platt]
+    n_platt   = max(20, int(0.20 * len(X_tr)))
+    X_platt   = X_tr[-n_platt:]
+    y_platt   = y_tr[-n_platt:]
+    X_tr_pure = X_tr[:-n_platt]
+    y_tr_pure = y_tr[:-n_platt]
+    _rng_cv   = np.random.default_rng(42 + fold)
 
-    cfg_fold = {k: v for k, v in AHN_CONFIG.items()}
-    cfg_fold['random_state'] = 42 + fold
-    m = AHNMixture(**cfg_fold)
-    m.fit(X_tr_pure, y_tr_pure, verbose=False)
-    m.fit_platt(X_platt, y_platt)
+    fold_scores = {}
 
-    yp   = m.predict(X_ho)
-    ypr  = m.predict_proba(X_ho)[:, 1]
-    auc  = roc_auc_score(y_ho, ypr)
-    ap   = average_precision_score(y_ho, ypr)
-    acc  = accuracy_score(y_ho, yp)
-    f1   = f1_score(y_ho, yp, zero_division=0)
-    cv_aucs.append(auc); cv_accs.append(acc); cv_f1s.append(f1); cv_aps.append(ap)
-    print(f"  {fold:>5}  {auc:.4f}   {ap:.4f}   {acc:.4f}   {f1:.4f}   "
-          f"a={m.platt_a:.3f}  b={m.platt_b:.3f}")
+    cfg_fold = {**AHN_CONFIG, 'random_state': 42 + fold}
+    m_ahn = AHNMixture(**cfg_fold)
+    m_ahn.fit(X_tr_pure, y_tr_pure, verbose=False)
+    m_ahn.fit_platt(X_platt, y_platt)
+    yp, ypr = m_ahn.predict(X_ho), m_ahn.predict_proba(X_ho)[:, 1]
+    fold_scores['AHN'] = dict(acc=accuracy_score(y_ho, yp), f1=f1_score(y_ho, yp, zero_division=0),
+                               ap=average_precision_score(y_ho, ypr), auc=roc_auc_score(y_ho, ypr))
 
-print(f"{'─'*70}")
-print(f"  {'Media':>5}  {np.mean(cv_aucs):.4f}   {np.mean(cv_aps):.4f}   {np.mean(cv_accs):.4f}   {np.mean(cv_f1s):.4f}")
-print(f"  {'±std':>5}  {np.std(cv_aucs):.4f}   {np.std(cv_aps):.4f}   {np.std(cv_accs):.4f}   {np.std(cv_f1s):.4f}")
-print(f"  [Test real AHN final: "
+    for name, bm in make_baselines(42 + fold).items():
+        fit_baseline(name, bm, X_tr_pure, y_tr_pure, _rng_cv)
+        cal = CalibratedBaseline(bm).fit_platt(X_platt, y_platt)
+        yp, ypr = cal.predict(X_ho), cal.predict_proba(X_ho)[:, 1]
+        fold_scores[name] = dict(acc=accuracy_score(y_ho, yp), f1=f1_score(y_ho, yp, zero_division=0),
+                                  ap=average_precision_score(y_ho, ypr), auc=roc_auc_score(y_ho, ypr))
+
+    for name in _CV_MODELS:
+        for met in _CV_METRICS:
+            cv_scores[name][met].append(fold_scores[name][met])
+        s = fold_scores[name]
+        print(f"  {fold:>5}  {name:<16}  {s['auc']:.4f}   {s['ap']:.4f}   {s['acc']:.4f}   {s['f1']:.4f}")
+
+print(f"{'─'*78}")
+print(f"  {'Modelo':<16}  {'AUC':>15}  {'AUC-PR':>15}  {'ACC':>15}  {'F1':>15}")
+for name in _CV_MODELS:
+    row = f"  {name:<16}"
+    for met in _CV_METRICS:
+        vals = cv_scores[name][met]
+        row += f"  {np.mean(vals):.4f}±{np.std(vals):.4f}"
+    print(row)
+print(f"\n  [Test real AHN final: "
       f"AUC={ahn_results['roc_auc']:.4f}  "
       f"AUC-PR={ahn_results['avg_precision']:.4f}  "
       f"ACC={ahn_results['test_acc']:.4f}  "
       f"F1={ahn_results['f1']:.4f}]")
+
+pd.DataFrame([
+    {'model': name, 'metric': met, 'fold': i + 1, 'value': v}
+    for name in _CV_MODELS for met in _CV_METRICS
+    for i, v in enumerate(cv_scores[name][met])
+]).to_csv(out('cv_results_all_models.csv'), index=False)
+print("  Guardado: cv_results_all_models.csv")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -659,23 +785,12 @@ print("\n" + "=" * 70)
 print("Entrenando modelos baseline...")
 print("=" * 70)
 
-baseline_models = {
-    'SVM': SVC(kernel='rbf', probability=True,
-               class_weight='balanced', random_state=42),
-    'Random Forest': RandomForestClassifier(
-        n_estimators=100, max_depth=10, min_samples_split=5, random_state=42
-    ),
-    'MLP': MLPClassifier(
-        hidden_layer_sizes=(64, 32), activation='relu', solver='adam',
-        alpha=0.001, learning_rate_init=0.001, max_iter=300,
-        early_stopping=True, validation_fraction=0.15, random_state=42
-    ),
-}
-
+baseline_models       = make_baselines(seed=42)
 baseline_results      = {}
 calibrated_baselines  = {}   # kept for reuse in robustness experiments if needed
+_rng_main = np.random.default_rng(42)
 for name, model in baseline_models.items():
-    model.fit(X_train, y_train)
+    fit_baseline(name, model, X_train, y_train, _rng_main)
 
     # Uniform calibration: same Platt procedure as AHN, fit on the same
     # validation set. Hard labels now come from the calibrated probability
@@ -727,6 +842,15 @@ rows.append({'Model': 'AHN', 'Type': 'AHN',
              'Recall':    ahn_results['recall'],    'F1-Score':  ahn_results['f1'],
              'Avg Precision (AUC-PR)': ahn_results['avg_precision'],
              'ROC-AUC':   ahn_results['roc_auc']})
+rows.append({'Model': 'All-Positive (Control)', 'Type': 'Control',
+             'Train Acc': ALL_POSITIVE_CONTROL['train_acc'],
+             'Val Acc':   ALL_POSITIVE_CONTROL['val_acc'],
+             'Test Acc':  ALL_POSITIVE_CONTROL['acc'],
+             'Precision': ALL_POSITIVE_CONTROL['precision'],
+             'Recall':    ALL_POSITIVE_CONTROL['recall'],
+             'F1-Score':  ALL_POSITIVE_CONTROL['f1'],
+             'Avg Precision (AUC-PR)': ALL_POSITIVE_CONTROL['ap'],
+             'ROC-AUC':   ALL_POSITIVE_CONTROL['auc']})
 
 comparison_df = (pd.DataFrame(rows)
                    .sort_values('ROC-AUC', ascending=False)
@@ -944,13 +1068,15 @@ for metric in ['Test Acc', 'F1-Score', 'Avg Precision (AUC-PR)', 'ROC-AUC']:
     for rank, (_, row) in enumerate(ranked.iterrows(), 1):
         print(f"  {rank}. {row['Model']:20s} {row[metric]:.4f}")
 
-# Score ponderado
+# Score ponderado (el control se excluye de la elección de "mejor modelo":
+# no es un candidato real, es una referencia de degeneración de clase)
 comparison_df['Overall Score'] = (
     0.3 * comparison_df['Test Acc'] +
     0.3 * comparison_df['F1-Score'] +
     0.4 * comparison_df['ROC-AUC']
 )
-best = comparison_df.loc[comparison_df['Overall Score'].idxmax()]
+_real_df = comparison_df[comparison_df['Type'] != 'Control']
+best = _real_df.loc[_real_df['Overall Score'].idxmax()]
 
 print("\n" + "=" * 70)
 print("MEJOR MODELO GENERAL  (score = 0.3*Acc + 0.3*F1 + 0.4*AUC)")
@@ -979,6 +1105,9 @@ print(f"  AUC-PR   : AHN {ahn_results['avg_precision']:.4f}  vs  Baseline {b_ap:
       f"({'UP' if ahn_results['avg_precision'] >= b_ap else 'DOWN'} {abs(ahn_results['avg_precision']-b_ap):.4f})")
 print(f"  ROC-AUC  : AHN {ahn_results['roc_auc']:.4f}  vs  Baseline {b_roc:.4f}  "
       f"({'UP' if ahn_results['roc_auc'] >= b_roc else 'DOWN'} {abs(ahn_results['roc_auc']-b_roc):.4f})")
+print(f"\n  [Control All-Positive F1={ALL_POSITIVE_CONTROL['f1']:.4f}  "
+      f"(Recall=1.0000 por construcción) — AHN F1={ahn_results['f1']:.4f} "
+      f"está {'por encima' if ahn_results['f1'] > ALL_POSITIVE_CONTROL['f1'] else 'por debajo'} de esta referencia]")
 
 # Guardar pickle
 with open(out('ahn_comparison_data.pkl'), 'wb') as f:
@@ -1018,29 +1147,26 @@ _MODELS  = ['AHN', 'SVM', 'Random Forest', 'MLP']
 _METRICS = ['acc', 'precision', 'recall', 'f1', 'ap', 'auc']
 _MLABELS = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'AUC-PR', 'ROC-AUC']
 
+# Reviewer #2: repetir los tres escenarios de robustez con múltiples semillas y
+# reportar bandas de varianza, en vez de una sola corrida — la oscilación de
+# MLP en la Fig. 1 original no bastaba para concluir robustez con una corrida.
+ROBUSTNESS_SEEDS = [0, 1, 2, 3, 4]
+
 _AHN_SWEEP = {k: v for k, v in AHN_CONFIG.items()}
 _AHN_SWEEP['n_restarts']     = 1
 _AHN_SWEEP['max_iterations'] = 40
 _AHN_SWEEP['patience']       = 10
 
-def _fresh_baselines():
-    return {
-        'SVM': SVC(kernel='rbf', probability=True,
-                   class_weight='balanced', random_state=42),
-        'Random Forest': RandomForestClassifier(
-            n_estimators=100, max_depth=10, min_samples_split=5, random_state=42),
-        'MLP': MLPClassifier(
-            hidden_layer_sizes=(64, 32), activation='relu', solver='adam',
-            alpha=0.001, learning_rate_init=0.001, max_iter=300,
-            early_stopping=True, validation_fraction=0.15, random_state=42),
-    }
-
-def _eval_all(X_tr, y_tr, X_te, y_te, ahn_seed=42):
+def _eval_all(X_tr, y_tr, X_te, y_te, seed=42):
+    """Fits AHN + all three baselines with one shared seed (controls AHN's own
+    randomness AND, via make_baselines(seed), every baseline's randomness), all
+    calibrated on the fixed X_val/y_val, and returns metrics for all four."""
     results = {}
+    _rng = np.random.default_rng(seed)
 
-    cfg = {**_AHN_SWEEP, 'random_state': ahn_seed}
+    cfg = {**_AHN_SWEEP, 'random_state': seed}
     _ahn = AHNMixture(**cfg)
-    _ahn.fit(X_tr, y_tr)
+    _ahn.fit(X_tr, y_tr, verbose=False)
     _ahn.fit_platt(X_val, y_val)          # calibrated on the fixed validation set
     yp  = _ahn.predict(X_te)              # now uses the calibrated probability
     ypr = _ahn.predict_proba(X_te)[:, 1]
@@ -1053,8 +1179,8 @@ def _eval_all(X_tr, y_tr, X_te, y_te, ahn_seed=42):
         'auc':       roc_auc_score(y_te, ypr),
     }
 
-    for name, model in _fresh_baselines().items():
-        model.fit(X_tr, y_tr)
+    for name, model in make_baselines(seed).items():
+        fit_baseline(name, model, X_tr, y_tr, _rng)
         # Same Platt protocol as AHN, fit on the same fixed validation set —
         # ensures every model in the sweep shares one calibration procedure
         # and one definition of the 0.5 operating point.
@@ -1071,18 +1197,30 @@ def _eval_all(X_tr, y_tr, X_te, y_te, ahn_seed=42):
         }
     return results
 
-def _plot_robustness(x_vals, df, x_col, x_labels, xlabel, title, fname,
+def _aggregate(df_raw, x_col):
+    """Collapses a long-format (seed, x_col, model, *metrics) DataFrame into
+    per-(model, x_col) mean and std across seeds."""
+    agg = df_raw.groupby(['model', x_col])[_METRICS].agg(['mean', 'std']).reset_index()
+    agg.columns = ['model', x_col] + [f'{met}_{stat}' for met, stat in agg.columns.tolist()[2:]]
+    std_cols = [f'{met}_std' for met in _METRICS]
+    agg[std_cols] = agg[std_cols].fillna(0.0)   # single-seed edge case
+    return agg
+
+def _plot_robustness(x_vals, agg_df, x_col, x_labels, xlabel, title, fname,
                      highlight_ref=None):
+    """Plots mean ± std (error bars) across ROBUSTNESS_SEEDS for each metric."""
     fig, axes = plt.subplots(1, 6, figsize=(26, 5))
-    fig.suptitle(title, fontsize=12, fontweight='bold', y=1.02)
+    fig.suptitle(f"{title}  (media ± std, {len(ROBUSTNESS_SEEDS)} semillas)",
+                 fontsize=12, fontweight='bold', y=1.02)
 
     for ax, met, mlbl in zip(axes, _METRICS, _MLABELS):
         for m in _MODELS:
-            vals = [df[(df.model == m) & (df[x_col] == v)][met].values[0]
-                    for v in x_vals]
-            ax.plot(range(len(x_vals)), vals,
-                    marker=_MARKERS[m], color=_PALETTE[m],
-                    lw=_LW[m], markersize=7, label=m, alpha=0.9)
+            sub = agg_df[agg_df.model == m].set_index(x_col).loc[x_vals]
+            means = sub[f'{met}_mean'].values
+            stds  = sub[f'{met}_std'].values
+            ax.errorbar(range(len(x_vals)), means, yerr=stds, capsize=3,
+                        marker=_MARKERS[m], color=_PALETTE[m],
+                        lw=_LW[m], markersize=7, label=m, alpha=0.9)
         if highlight_ref is not None:
             ax.axvline(highlight_ref, color='gray', lw=1.2, ls='--',
                        alpha=0.6, label='Ref. limpia')
@@ -1100,16 +1238,17 @@ def _plot_robustness(x_vals, df, x_col, x_labels, xlabel, title, fname,
     print(f"  Guardado: {fname}")
     plt.close()
 
-def _print_table(x_vals, x_col_label, all_results, x_labels):
-    header = f"  {'':>18}" + "".join(f"  {lbl:>9}" for lbl in _MLABELS)
-    sep    = "  " + "-" * (18 + 11 * len(_MLABELS))
-    for xlbl, res in zip(x_labels, all_results):
+def _print_table(x_vals, x_col_label, agg_df, x_labels, x_col):
+    header = f"  {'':>18}" + "".join(f"  {lbl:>15}" for lbl in _MLABELS)
+    sep    = "  " + "-" * (18 + 17 * len(_MLABELS))
+    for xlbl, xv in zip(x_labels, x_vals):
         print(f"\n  {x_col_label}={xlbl}")
         print(sep); print(header); print(sep)
         for m in _MODELS:
             row = f"  {m:>18}"
+            sub = agg_df[(agg_df.model == m) & (agg_df[x_col] == xv)]
             for met in _METRICS:
-                row += f"  {res[m][met]:>9.4f}"
+                row += f"  {sub[f'{met}_mean'].values[0]:.3f}±{sub[f'{met}_std'].values[0]:.3f}"
             print(row)
 
 
@@ -1123,46 +1262,48 @@ print("\n" + "=" * 70)
 print("EXP 1 — DATA SCARCITY  [Exoplanetas KOI]")
 print("=" * 70)
 print("  Submuestreo estratificado de X_train  |  X_val, X_test fijos")
-print(f"  Fracciones: {[f'{f:.0%}' for f in SCARCITY_FRACTIONS]}\n")
+print(f"  Fracciones: {[f'{f:.0%}' for f in SCARCITY_FRACTIONS]}")
+print(f"  Semillas: {ROBUSTNESS_SEEDS}  (media ± std sobre {len(ROBUSTNESS_SEEDS)} corridas)\n")
 
-sc_results = []
-sc_sizes   = []
+sc_rows  = []
+sc_sizes = {}
 
 for frac in SCARCITY_FRACTIONS:
     n = max(int(len(X_train) * frac), 10)
-    if frac < 1.0:
-        idx, _ = _tts(np.arange(len(X_train)), train_size=n,
-                      stratify=y_train, random_state=42)
-    else:
-        idx = np.arange(len(X_train))
+    sc_sizes[frac] = n
+    for seed in ROBUSTNESS_SEEDS:
+        if frac < 1.0:
+            idx, _ = _tts(np.arange(len(X_train)), train_size=n,
+                          stratify=y_train, random_state=seed)
+        else:
+            idx = np.arange(len(X_train))
+        X_sub, y_sub = X_train[idx], y_train[idx]
+        res = _eval_all(X_sub, y_sub, X_test, y_test, seed=seed)
+        for m in _MODELS:
+            sc_rows.append({'model': m, 'fraction': frac, 'seed': seed, **res[m]})
 
-    X_sub, y_sub = X_train[idx], y_train[idx]
-    sc_sizes.append(len(X_sub))
-    res = _eval_all(X_sub, y_sub, X_test, y_test)
-    sc_results.append(res)
-    print(f"  frac={frac:.0%}  n={len(X_sub):5d}  |  "
-          + "  ".join(f"{m} AUC={res[m]['auc']:.3f}" for m in _MODELS))
+    mean_auc = {m: np.mean([r['auc'] for r in sc_rows
+                             if r['fraction'] == frac and r['model'] == m]) for m in _MODELS}
+    print(f"  frac={frac:.0%}  n≈{sc_sizes[frac]:5d}  |  "
+          + "  ".join(f"{m} AUC={mean_auc[m]:.3f}" for m in _MODELS))
 
-_print_table(SCARCITY_FRACTIONS, 'frac', sc_results,
-             [f"{f:.0%} (n={n})" for f, n in zip(SCARCITY_FRACTIONS, sc_sizes)])
+sc_raw_df = pd.DataFrame(sc_rows)
+sc_raw_df.to_csv(out('robustness_scarcity_raw.csv'), index=False)   # per-seed, for transparency
+sc_df = _aggregate(sc_raw_df, 'fraction')
+sc_df.to_csv(out('robustness_scarcity.csv'), index=False)           # mean ± std, used by plots/tables
 
-sc_df = pd.DataFrame([
-    {'model': m, 'fraction': f, 'n_train': n,
-     **{met: sc_results[i][m][met] for met in _METRICS}}
-    for i, (f, n) in enumerate(zip(SCARCITY_FRACTIONS, sc_sizes))
-    for m in _MODELS
-])
-sc_df.to_csv(out('robustness_scarcity.csv'), index=False)
+_print_table(SCARCITY_FRACTIONS, 'frac', sc_df,
+             [f"{f:.0%} (n={sc_sizes[f]})" for f in SCARCITY_FRACTIONS], 'fraction')
 
 _plot_robustness(
     SCARCITY_FRACTIONS, sc_df, 'fraction',
-    [f"{f:.0%}\n(n={n})" for f, n in zip(SCARCITY_FRACTIONS, sc_sizes)],
+    [f"{f:.0%}\n(n={sc_sizes[f]})" for f in SCARCITY_FRACTIONS],
     'Fracción del train set',
     'EXP 1 — Data Scarcity [Exoplanetas]: Métricas según tamaño del train set',
     'robustness_scarcity.png',
     highlight_ref=len(SCARCITY_FRACTIONS) - 1,
 )
-print("  Guardado: robustness_scarcity.csv")
+print("  Guardado: robustness_scarcity.csv (agregado)  /  robustness_scarcity_raw.csv (por semilla)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1175,62 +1316,64 @@ print("\n" + "=" * 70)
 print("EXP 2 — FEATURE NOISE  [Exoplanetas KOI]")
 print("=" * 70)
 print("  Entrenar con X_train limpio  |  Ruido N(0,σ) añadido a X_test")
-print(f"  σ: {NOISE_SIGMAS}  (escala escalada [-1,1])\n")
+print(f"  σ: {NOISE_SIGMAS}  (escala escalada [-1,1])")
+print(f"  Semillas: {ROBUSTNESS_SEEDS}  (media ± std sobre {len(ROBUSTNESS_SEEDS)} corridas)\n")
 
-# Entrenar una sola vez en limpio, calibrar una sola vez en validación limpia
-# (misma disciplina para AHN y para los tres baselines)
-_ahn_fn = AHNMixture(**_AHN_SWEEP)
-_ahn_fn.fit(X_train, y_train)
-_ahn_fn.fit_platt(X_val, y_val)
+fn_rows = []
 
-_bl_fn_raw = _fresh_baselines()
-_bl_fn     = {}
-for _name, _m in _bl_fn_raw.items():
-    _m.fit(X_train, y_train)
-    _bl_fn[_name] = CalibratedBaseline(_m).fit_platt(X_val, y_val)
+for seed in ROBUSTNESS_SEEDS:
+    # Entrenar y calibrar una sola vez por semilla (en limpio), luego evaluar
+    # en todos los niveles de sigma — misma disciplina que antes, repetida
+    # ahora sobre varias semillas para poder reportar media ± std.
+    _rng = np.random.default_rng(seed)
 
-fn_rows  = []
-_rng_fn  = np.random.default_rng(0)
+    cfg_fn = {**_AHN_SWEEP, 'random_state': seed}
+    _ahn_fn = AHNMixture(**cfg_fn)
+    _ahn_fn.fit(X_train, y_train, verbose=False)
+    _ahn_fn.fit_platt(X_val, y_val)
 
-for sigma in NOISE_SIGMAS:
-    X_te_n = X_test + (_rng_fn.normal(0, sigma, X_test.shape) if sigma > 0 else 0)
+    _bl_fn = {}
+    for name, model in make_baselines(seed).items():
+        fit_baseline(name, model, X_train, y_train, _rng)
+        _bl_fn[name] = CalibratedBaseline(model).fit_platt(X_val, y_val)
 
-    res = {}
-    yp  = _ahn_fn.predict(X_te_n)
-    ypr = _ahn_fn.predict_proba(X_te_n)[:, 1]
-    res['AHN'] = {
-        'acc':       accuracy_score(y_test, yp),
-        'precision': precision_score(y_test, yp, zero_division=0),
-        'recall':    recall_score(y_test, yp, zero_division=0),
-        'f1':        f1_score(y_test, yp, zero_division=0),
-        'ap':        average_precision_score(y_test, ypr),
-        'auc':       roc_auc_score(y_test, ypr),
-    }
-    for name, cal in _bl_fn.items():
-        yp  = cal.predict(X_te_n)
-        ypr = cal.predict_proba(X_te_n)[:, 1]
-        res[name] = {
+    _rng_noise = np.random.default_rng(2000 + seed)
+    for sigma in NOISE_SIGMAS:
+        X_te_n = X_test + (_rng_noise.normal(0, sigma, X_test.shape) if sigma > 0 else 0)
+
+        yp  = _ahn_fn.predict(X_te_n)
+        ypr = _ahn_fn.predict_proba(X_te_n)[:, 1]
+        fn_rows.append({'model': 'AHN', 'sigma': sigma, 'seed': seed,
             'acc':       accuracy_score(y_test, yp),
             'precision': precision_score(y_test, yp, zero_division=0),
             'recall':    recall_score(y_test, yp, zero_division=0),
             'f1':        f1_score(y_test, yp, zero_division=0),
             'ap':        average_precision_score(y_test, ypr),
             'auc':       roc_auc_score(y_test, ypr),
-        }
+        })
+        for name, cal in _bl_fn.items():
+            yp  = cal.predict(X_te_n)
+            ypr = cal.predict_proba(X_te_n)[:, 1]
+            fn_rows.append({'model': name, 'sigma': sigma, 'seed': seed,
+                'acc':       accuracy_score(y_test, yp),
+                'precision': precision_score(y_test, yp, zero_division=0),
+                'recall':    recall_score(y_test, yp, zero_division=0),
+                'f1':        f1_score(y_test, yp, zero_division=0),
+                'ap':        average_precision_score(y_test, ypr),
+                'auc':       roc_auc_score(y_test, ypr),
+            })
 
-    for m in _MODELS:
-        fn_rows.append({'model': m, 'sigma': sigma, **res[m]})
+    mean_auc0 = {m: np.mean([r['auc'] for r in fn_rows
+                              if r['sigma'] == 0.0 and r['seed'] == seed and r['model'] == m])
+                 for m in _MODELS}
+    print(f"  seed={seed}  σ=0.00  |  " + "  ".join(f"{m} AUC={mean_auc0[m]:.3f}" for m in _MODELS))
 
-    print(f"  σ={sigma:.2f}  |  "
-          + "  ".join(f"{m} AUC={res[m]['auc']:.3f}" for m in _MODELS))
-
-fn_df = pd.DataFrame(fn_rows)
-_print_table(NOISE_SIGMAS, 'σ', [
-    {m: {met: fn_df[(fn_df.model==m)&(fn_df.sigma==s)][met].values[0]
-         for met in _METRICS} for m in _MODELS}
-    for s in NOISE_SIGMAS], [f"σ={s}" for s in NOISE_SIGMAS])
-
+fn_raw_df = pd.DataFrame(fn_rows)
+fn_raw_df.to_csv(out('robustness_feature_noise_raw.csv'), index=False)
+fn_df = _aggregate(fn_raw_df, 'sigma')
 fn_df.to_csv(out('robustness_feature_noise.csv'), index=False)
+
+_print_table(NOISE_SIGMAS, 'σ', fn_df, [f"σ={s}" for s in NOISE_SIGMAS], 'sigma')
 
 _plot_robustness(
     NOISE_SIGMAS, fn_df, 'sigma',
@@ -1240,7 +1383,7 @@ _plot_robustness(
     'robustness_feature_noise.png',
     highlight_ref=0,
 )
-print("  Guardado: robustness_feature_noise.csv")
+print("  Guardado: robustness_feature_noise.csv (agregado)  /  robustness_feature_noise_raw.csv (por semilla)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1253,32 +1396,32 @@ print("\n" + "=" * 70)
 print("EXP 3 — LABEL NOISE  [Exoplanetas KOI]")
 print("=" * 70)
 print("  Flip aleatorio de p% de y_train  |  y_test siempre limpio")
-print(f"  Tasas: {[f'{p:.0%}' for p in FLIP_RATES]}\n")
+print(f"  Tasas: {[f'{p:.0%}' for p in FLIP_RATES]}")
+print(f"  Semillas: {ROBUSTNESS_SEEDS}  (media ± std sobre {len(ROBUSTNESS_SEEDS)} corridas)\n")
 
-ln_rows  = []
-_rng_ln  = np.random.default_rng(1)
+ln_rows = []
 
 for flip_rate in FLIP_RATES:
-    y_noisy = y_train.copy()
-    if flip_rate > 0:
-        flip_mask = _rng_ln.random(len(y_noisy)) < flip_rate
-        y_noisy[flip_mask] = 1 - y_noisy[flip_mask]
-    n_flipped = (y_noisy != y_train).sum()
+    for seed in ROBUSTNESS_SEEDS:
+        _rng_ln = np.random.default_rng(1000 + seed)
+        y_noisy = y_train.copy()
+        if flip_rate > 0:
+            flip_mask = _rng_ln.random(len(y_noisy)) < flip_rate
+            y_noisy[flip_mask] = 1 - y_noisy[flip_mask]
+        res = _eval_all(X_train, y_noisy, X_test, y_test, seed=seed)
+        for m in _MODELS:
+            ln_rows.append({'model': m, 'flip_rate': flip_rate, 'seed': seed, **res[m]})
 
-    res = _eval_all(X_train, y_noisy, X_test, y_test)
-    for m in _MODELS:
-        ln_rows.append({'model': m, 'flip_rate': flip_rate, **res[m]})
+    mean_auc = {m: np.mean([r['auc'] for r in ln_rows
+                             if r['flip_rate'] == flip_rate and r['model'] == m]) for m in _MODELS}
+    print(f"  flip={flip_rate:.0%}  |  " + "  ".join(f"{m} AUC={mean_auc[m]:.3f}" for m in _MODELS))
 
-    print(f"  flip={flip_rate:.0%}  ({n_flipped:4d} etiq.)  |  "
-          + "  ".join(f"{m} AUC={res[m]['auc']:.3f}" for m in _MODELS))
-
-ln_df = pd.DataFrame(ln_rows)
-_print_table(FLIP_RATES, 'flip', [
-    {m: {met: ln_df[(ln_df.model==m)&(ln_df.flip_rate==fp)][met].values[0]
-         for met in _METRICS} for m in _MODELS}
-    for fp in FLIP_RATES], [f"{p:.0%}" for p in FLIP_RATES])
-
+ln_raw_df = pd.DataFrame(ln_rows)
+ln_raw_df.to_csv(out('robustness_label_noise_raw.csv'), index=False)
+ln_df = _aggregate(ln_raw_df, 'flip_rate')
 ln_df.to_csv(out('robustness_label_noise.csv'), index=False)
+
+_print_table(FLIP_RATES, 'flip', ln_df, [f"{p:.0%}" for p in FLIP_RATES], 'flip_rate')
 
 _plot_robustness(
     FLIP_RATES, ln_df, 'flip_rate',
@@ -1288,7 +1431,7 @@ _plot_robustness(
     'robustness_label_noise.png',
     highlight_ref=0,
 )
-print("  Guardado: robustness_label_noise.csv")
+print("  Guardado: robustness_label_noise.csv (agregado)  /  robustness_label_noise_raw.csv (por semilla)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1300,37 +1443,46 @@ print("RESUMEN DE ROBUSTEZ — Caída de AUC (condición limpia → más extrema
 print("=" * 70)
 
 def _get(df, m, met, x_col, x_val):
-    return df[(df.model == m) & (df[x_col] == x_val)][met].values[0]
+    return df[(df.model == m) & (df[x_col] == x_val)][f'{met}_mean'].values[0]
 
-print(f"\n  {'Experimento':<24}  {'Modelo':<16}  {'AUC limpio':>10}  {'AUC extremo':>11}  {'ΔAUC':>7}"
-      f"  {'AP limpio':>9}  {'AP extremo':>10}  {'ΔAP':>7}")
-print("  " + "-" * 100)
+def _get_std(df, m, met, x_col, x_val):
+    return df[(df.model == m) & (df[x_col] == x_val)][f'{met}_std'].values[0]
+
+print(f"\n  {'Experimento':<24}  {'Modelo':<16}  {'AUC limpio':>10}  {'AUC extremo (±std semillas)':>28}  {'ΔAUC':>7}"
+      f"  {'AP limpio':>9}  {'AP extremo (±std semillas)':>27}  {'ΔAP':>7}")
+print("  " + "-" * 130)
 
 for m in _MODELS:
-    a_c = _get(sc_df, m, 'auc', 'fraction', 1.00)
-    a_e = _get(sc_df, m, 'auc', 'fraction', 0.05)
-    p_c = _get(sc_df, m, 'ap', 'fraction', 1.00)
-    p_e = _get(sc_df, m, 'ap', 'fraction', 0.05)
-    print(f"  {'Scarcity (5%→100%)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}"
-          f"  {p_c:>9.4f}  {p_e:>10.4f}  {p_e-p_c:>+7.4f}")
+    a_c     = _get(sc_df, m, 'auc', 'fraction', 1.00)
+    a_e     = _get(sc_df, m, 'auc', 'fraction', 0.05)
+    a_e_std = _get_std(sc_df, m, 'auc', 'fraction', 0.05)
+    p_c     = _get(sc_df, m, 'ap', 'fraction', 1.00)
+    p_e     = _get(sc_df, m, 'ap', 'fraction', 0.05)
+    p_e_std = _get_std(sc_df, m, 'ap', 'fraction', 0.05)
+    print(f"  {'Scarcity (5%→100%)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:.4f} ± {a_e_std:<20.4f}  {a_e-a_c:>+7.4f}"
+          f"  {p_c:>9.4f}  {p_e:.4f} ± {p_e_std:<19.4f}  {p_e-p_c:>+7.4f}")
 
 print()
 for m in _MODELS:
-    a_c = _get(fn_df, m, 'auc', 'sigma', 0.0)
-    a_e = _get(fn_df, m, 'auc', 'sigma', 1.0)
-    p_c = _get(fn_df, m, 'ap', 'sigma', 0.0)
-    p_e = _get(fn_df, m, 'ap', 'sigma', 1.0)
-    print(f"  {'Feature Noise (σ=1.0)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}"
-          f"  {p_c:>9.4f}  {p_e:>10.4f}  {p_e-p_c:>+7.4f}")
+    a_c     = _get(fn_df, m, 'auc', 'sigma', 0.0)
+    a_e     = _get(fn_df, m, 'auc', 'sigma', 1.0)
+    a_e_std = _get_std(fn_df, m, 'auc', 'sigma', 1.0)
+    p_c     = _get(fn_df, m, 'ap', 'sigma', 0.0)
+    p_e     = _get(fn_df, m, 'ap', 'sigma', 1.0)
+    p_e_std = _get_std(fn_df, m, 'ap', 'sigma', 1.0)
+    print(f"  {'Feature Noise (σ=1.0)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:.4f} ± {a_e_std:<20.4f}  {a_e-a_c:>+7.4f}"
+          f"  {p_c:>9.4f}  {p_e:.4f} ± {p_e_std:<19.4f}  {p_e-p_c:>+7.4f}")
 
 print()
 for m in _MODELS:
-    a_c = _get(ln_df, m, 'auc', 'flip_rate', 0.00)
-    a_e = _get(ln_df, m, 'auc', 'flip_rate', 0.20)
-    p_c = _get(ln_df, m, 'ap', 'flip_rate', 0.00)
-    p_e = _get(ln_df, m, 'ap', 'flip_rate', 0.20)
-    print(f"  {'Label Noise (20% flip)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:>11.4f}  {a_e-a_c:>+7.4f}"
-          f"  {p_c:>9.4f}  {p_e:>10.4f}  {p_e-p_c:>+7.4f}")
+    a_c     = _get(ln_df, m, 'auc', 'flip_rate', 0.00)
+    a_e     = _get(ln_df, m, 'auc', 'flip_rate', 0.20)
+    a_e_std = _get_std(ln_df, m, 'auc', 'flip_rate', 0.20)
+    p_c     = _get(ln_df, m, 'ap', 'flip_rate', 0.00)
+    p_e     = _get(ln_df, m, 'ap', 'flip_rate', 0.20)
+    p_e_std = _get_std(ln_df, m, 'ap', 'flip_rate', 0.20)
+    print(f"  {'Label Noise (20% flip)':<24}  {m:<16}  {a_c:>10.4f}  {a_e:.4f} ± {a_e_std:<20.4f}  {a_e-a_c:>+7.4f}"
+          f"  {p_c:>9.4f}  {p_e:.4f} ± {p_e_std:<19.4f}  {p_e-p_c:>+7.4f}")
 
 print("\n" + "=" * 70)
 print("EXPERIMENTOS DE ROBUSTEZ FINALIZADOS  [Exoplanetas KOI]")
