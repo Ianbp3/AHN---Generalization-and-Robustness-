@@ -267,11 +267,11 @@ class AHNCompound:
             if verbose and (it % 10 == 0 or it < 3):
                 sizes = [(assignments == j).sum() for j in range(self.m)]
                 star  = '*' if E_global == best_E else ' '
-                print(f"  Iter {it+1:3d}{star}| E_global={E_global:.6f} | particiones={sizes}")
+                print(f"  Iter {it+1:3d}{star}| E_global={E_global:.6f} | partitions={sizes}")
 
             if E_global <= self.epsilon:
                 if verbose:
-                    print(f"  Convergido en iter {it+1}  (E={E_global:.6f} <= {self.epsilon})")
+                    print(f"  Converged at iter {it+1}  (E={E_global:.6f} <= {self.epsilon})")
                 break
 
             if self.m > 1:
@@ -285,12 +285,12 @@ class AHNCompound:
                     self._init_bounds(X)
                     no_improve = 0
                     if verbose:
-                        print(f"  ↺ Reinit bounds en iter {it+1}  (sin mejora por {self.patience} iters)")
+                        print(f"  ↺ Reinit bounds at iter {it+1}  (no improvement for {self.patience} iters)")
 
         self._restore(best_snap)
         self.best_E_ = best_E
         if verbose:
-            print(f"  ✓ Best-state restaurado  (E_best={best_E:.6f})")
+            print(f"  ✓ Best-state restored  (E_best={best_E:.6f})")
         return self
 
     def predict_raw(self, X):
@@ -355,7 +355,7 @@ class AHNMixture:
             for i in range(self.c):
                 if verbose:
                     mid = 'CH2-' * (self.m - 2)
-                    print(f"\n  Compuesto {i+1}/{self.c}  (CH3-{mid}CH3):")
+                    print(f"\n  Compound {i+1}/{self.c}  (CH3-{mid}CH3):")
                 seed = self.rs + i + restart * self.c
                 comp = self._make_compound(seed)
                 comp.fit(X, y, verbose=verbose)
@@ -366,7 +366,7 @@ class AHNMixture:
                 best_E_total   = E_total
                 best_compounds = compounds_try
                 if verbose and self.n_restarts > 1:
-                    print(f"  ★ Nuevo mejor  E={E_total:.6f}  (restart {restart+1})")
+                    print(f"  ★ New best  E={E_total:.6f}  (restart {restart+1})")
 
         self.compounds = best_compounds
 
@@ -468,7 +468,7 @@ class CalibratedBaseline:
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("=" * 70)
-print("COMPARACION COMPLETA: AHN vs Baseline Models — NASA Exoplanets KOI")
+print("FULL COMPARISON: AHN vs Baseline Models — NASA Exoplanets KOI")
 print("=" * 70)
 
 NASA_URL = ("https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/"
@@ -489,7 +489,7 @@ FEATURES = [
 
 try:
     df = pd.read_csv(NASA_URL)
-    print(f"Dataset descargado desde NASA Exoplanet Archive: {len(df)} filas")
+    print(f"Dataset downloaded from NASA Exoplanet Archive: {len(df)} rows")
     df_sel = df[FEATURES + ['koi_disposition']].dropna()
     df_bin = df_sel[
         df_sel['koi_disposition'].isin(['CONFIRMED', 'FALSE POSITIVE'])
@@ -498,10 +498,11 @@ try:
     X_array = df_bin[FEATURES].values.astype(float)
     y       = df_bin['label'].values
     DATA_SOURCE = "NASA Exoplanet Archive KOI"
+    _df_full_for_errors = df   # kept only to look up *_err1/*_err2 columns below
 except Exception:
     try:
         df = pd.read_csv("cumulative_koi.csv")
-        print("Dataset cargado desde archivo local")
+        print("Dataset loaded from local file")
         df_sel = df[FEATURES + ['koi_disposition']].dropna()
         df_bin = df_sel[
             df_sel['koi_disposition'].isin(['CONFIRMED', 'FALSE POSITIVE'])
@@ -510,48 +511,113 @@ except Exception:
         X_array = df_bin[FEATURES].values.astype(float)
         y       = df_bin['label'].values
         DATA_SOURCE = "NASA KOI (local)"
+        _df_full_for_errors = df
     except Exception:
-        print("⚠  Dataset real no disponible — usando datos sintéticos que replican")
-        print("   las características del catálogo KOI:")
-        print("   2000 muestras · 10 features · desbalance 55/45 · señal de tránsito")
+        print("⚠  Real dataset unavailable — using synthetic data that replicates")
+        print("   the characteristics of the KOI catalog:")
+        print("   2000 samples · 10 features · 55/45 imbalance · transit signal")
         from sklearn.datasets import make_classification
         X_array, y = make_classification(
             n_samples=2000, n_features=10, n_informative=6, n_redundant=2,
             n_clusters_per_class=2, weights=[0.45, 0.55],
             flip_y=0.04, random_state=42
         )
-        DATA_SOURCE = "Sintético (réplica KOI)"
+        DATA_SOURCE = "Synthetic (KOI replica)"
+        _df_full_for_errors = None   # no archive columns to pull from
 
-X_temp, X_test,  y_temp, y_test  = train_test_split(
-    X_array, y, test_size=0.2, stratify=y, random_state=42
+# ── Incertidumbre real por objeto/feature (Reviewer #1, punto de menor
+# prioridad): la tabla KOI publica columnas de error por objeto para las
+# cantidades físicas medidas, con la convención {feature}_err1 (superior) /
+# {feature}_err2 (inferior). Las recolectamos aquí, alineadas fila-a-fila con
+# X_array, para poder usarlas más adelante como una alternativa físicamente
+# fundamentada al ruido gaussiano de sigma plano en el experimento de Feature
+# Noise. Si una feature no tiene columnas de error en este pull del archivo
+# (p.ej. koi_model_snr, que es un diagnóstico derivado sin incertidumbre de
+# medición propia, o datos sintéticos), esa columna se marca sin cobertura y
+# el generador de ruido físico recae automáticamente en el esquema de sigma
+# plano SOLO para esa feature — nunca en un fallback global silencioso.
+_ERR_SUFFIXES = ('_err1', '_err2')
+_feat_has_err_cols = {feat: False for feat in FEATURES}
+U_raw_all = None
+
+if _df_full_for_errors is not None:
+    U_df = pd.DataFrame(index=df_bin.index, columns=FEATURES, dtype=float)
+    for feat in FEATURES:
+        c1, c2 = f'{feat}{_ERR_SUFFIXES[0]}', f'{feat}{_ERR_SUFFIXES[1]}'
+        if c1 in _df_full_for_errors.columns and c2 in _df_full_for_errors.columns:
+            e1 = _df_full_for_errors.loc[df_bin.index, c1].abs()
+            e2 = _df_full_for_errors.loc[df_bin.index, c2].abs()
+            u  = (e1 + e2) / 2.0
+            u  = u.replace(0.0, np.nan)   # a reported 0 is a placeholder, not real precision
+            if u.notna().sum() > 0:
+                U_df[feat] = u
+                _feat_has_err_cols[feat] = True
+    if any(_feat_has_err_cols.values()):
+        for feat in FEATURES:
+            if _feat_has_err_cols[feat]:
+                U_df[feat] = U_df[feat].fillna(U_df[feat].median())
+        U_raw_all = U_df.values   # same row order as X_array — positional indexing matches
+
+
+idx_all = np.arange(len(X_array))
+idx_temp, idx_test = train_test_split(
+    idx_all, test_size=0.2, stratify=y, random_state=42
 )
-X_train, X_val, y_train, y_val = train_test_split(
-    X_temp,  y_temp, test_size=0.25, stratify=y_temp, random_state=42
+idx_train, idx_val = train_test_split(
+    idx_temp, test_size=0.25, stratify=y[idx_temp], random_state=42
 )
+# Identical partition to splitting X_array/y directly with the same
+# random_state — index-based only so U_raw_all can be sliced the same way.
+X_train, X_val, X_test = X_array[idx_train], X_array[idx_val], X_array[idx_test]
+y_train, y_val, y_test = y[idx_train],       y[idx_val],       y[idx_test]
 
 scaler  = MinMaxScaler(feature_range=(-1, 1))
 X_train = scaler.fit_transform(X_train)
 X_val   = scaler.transform(X_val)
 X_test  = scaler.transform(X_test)
 
+# Incertidumbre real por objeto, para el test set, en el mismo espacio escalado
+# [-1,1] donde se inyecta el ruido: una incertidumbre es una diferencia, así
+# que solo aplica la parte multiplicativa del escalado Min-Max (el offset
+# aditivo se cancela). Features sin cobertura real quedan en 1.0, que
+# reproduce exactamente el ruido plano sigma*N(0,1) original para esa feature.
+U_test_scaled = np.ones((len(idx_test), len(FEATURES)))
+if U_raw_all is not None:
+    for _j, _feat in enumerate(FEATURES):
+        if _feat_has_err_cols[_feat]:
+            U_test_scaled[:, _j] = U_raw_all[idx_test, _j] * scaler.scale_[_j]
+
 print(f"Features: {X_train.shape[1]}")
 print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
-print(f"Balance test — Confirmed: {(y_test==1).sum()}, False Positive: {(y_test==0).sum()}")
+print(f"Test balance — Confirmed: {(y_test==1).sum()}, False Positive: {(y_test==0).sum()}")
 
 # ── RESUMEN DEL DATASET  (Reviewer #1: N, class ratio, feature names) ────────
 print("\n" + "=" * 70)
-print("RESUMEN DEL DATASET  (para Sección III-A del paper)")
+print("DATASET SUMMARY  (for Section III-A of the paper)")
 print("=" * 70)
-print(f"  Fuente de datos        : {DATA_SOURCE}")
-print(f"  N total (tras dropna)  : {len(X_array)}")
-print(f"  Balance global         : Confirmed={int((y==1).sum())} ({(y==1).mean():.1%})   "
+print(f"  Data source            : {DATA_SOURCE}")
+print(f"  N total (after dropna) : {len(X_array)}")
+print(f"  Overall balance        : Confirmed={int((y==1).sum())} ({(y==1).mean():.1%})   "
       f"False Positive={int((y==0).sum())} ({(y==0).mean():.1%})")
 print(f"  N train / val / test   : {len(X_train)} / {len(X_val)} / {len(X_test)}")
-print(f"  Balance train          : Confirmed={int((y_train==1).sum())} ({(y_train==1).mean():.1%})   "
+print(f"  Train balance          : Confirmed={int((y_train==1).sum())} ({(y_train==1).mean():.1%})   "
       f"False Positive={int((y_train==0).sum())} ({(y_train==0).mean():.1%})")
-print(f"  Balance test           : Confirmed={int((y_test==1).sum())} ({(y_test==1).mean():.1%})   "
+print(f"  Test balance           : Confirmed={int((y_test==1).sum())} ({(y_test==1).mean():.1%})   "
       f"False Positive={int((y_test==0).sum())} ({(y_test==0).mean():.1%})")
 print(f"  Features ({len(FEATURES)})       : {', '.join(FEATURES)}")
+
+_n_with_err = sum(_feat_has_err_cols.values())
+if U_raw_all is not None:
+    print(f"  Real uncertainty (err1/err2) available for {_n_with_err}/{len(FEATURES)} features:")
+    for _feat in FEATURES:
+        if _feat_has_err_cols[_feat]:
+            _rel = np.median(U_raw_all[:, FEATURES.index(_feat)]) / (np.abs(X_array[:, FEATURES.index(_feat)]).mean() + 1e-12)
+            print(f"    {_feat:<15} yes  (median relative uncertainty ≈ {_rel:.2%})")
+        else:
+            print(f"    {_feat:<15} no  (no err1/err2 columns in this pull — will use flat sigma)")
+else:
+    print(f"  Real uncertainty (err1/err2): not available (source = {DATA_SOURCE}) — "
+          f"Exp. 2b (physical noise) will use flat sigma as in Exp. 2")
 
 pd.DataFrame([{
     'data_source': DATA_SOURCE, 'n_total': len(X_array),
@@ -559,7 +625,7 @@ pd.DataFrame([{
     'n_train': len(X_train), 'n_val': len(X_val), 'n_test': len(X_test),
     'n_features': len(FEATURES), 'features': ';'.join(FEATURES),
 }]).to_csv(out('dataset_summary.csv'), index=False)
-print("  Guardado: dataset_summary.csv")
+print("  Saved: dataset_summary.csv")
 
 # ── CONTROL: clasificador trivial "todo positivo"  (Reviewer #1) ─────────────
 # Distingue una ventaja de robustez genuina de un modelo que simplemente
@@ -586,7 +652,7 @@ ALL_POSITIVE_CONTROL = {
 print(f"\nControl (All-Positive): Acc={ALL_POSITIVE_CONTROL['acc']:.4f}, "
       f"Precision={ALL_POSITIVE_CONTROL['precision']:.4f}, Recall={ALL_POSITIVE_CONTROL['recall']:.4f}, "
       f"F1={ALL_POSITIVE_CONTROL['f1']:.4f}  "
-      f"(referencia fija: ignora X, no cambia con ruido/escasez)")
+      f"(fixed reference: ignores X, unaffected by noise/scarcity)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -594,7 +660,7 @@ print(f"\nControl (All-Positive): Acc={ALL_POSITIVE_CONTROL['acc']:.4f}, "
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 70)
-print("Entrenando AHN (Artificial Hydrocarbon Networks)...")
+print("Training AHN (Artificial Hydrocarbon Networks)...")
 print("=" * 70)
 
 
@@ -609,13 +675,19 @@ AHN_CONFIG = dict(
     use_bce        = False,
     threshold      = 0.5,
     patience       = 20,    # iters sin mejora antes de reinit bounds
-    n_restarts     = 3,     # 3 restarts → queda con el de menor E_best
+    n_restarts     = 1,     # Ablation (20 seeds, n_restarts=1 vs 3): AUC/AP
+                             # identical to 3-4 decimals either way; F1 variance
+                             # roughly halves with 3 restarts (0.0050→0.0026) but
+                             # its mean doesn't improve — best-state tracking
+                             # already converges to nearly the same result
+                             # regardless of initialization, so restarts weren't
+                             # earning their 3x training cost on this data.
 )
 m = AHN_CONFIG['n_molecules']
 if   m == 1: _struct = "CH3"
 elif m == 2: _struct = "CH3-CH3"
 else:        _struct = "CH3-" + "CH2-" * (m - 2) + "CH3"
-print(f"Estructura: {_struct}  |  eta={AHN_CONFIG['learning_rate']}  "
+print(f"Structure: {_struct}  |  eta={AHN_CONFIG['learning_rate']}  "
       f"|  eps={AHN_CONFIG['tolerance']}  |  max_iter={AHN_CONFIG['max_iterations']}  "
       f"|  bias={AHN_CONFIG['use_bias']}  |  bce={AHN_CONFIG['use_bce']}")
 
@@ -665,11 +737,11 @@ ahn.fit(X_train, y_train, verbose=True)
 
 _pc1_var = ahn.compounds[0].pc1_explained_variance_ratio_
 if _pc1_var is not None:
-    print(f"\nVarianza explicada por la 1a componente principal "
-          f"(PCA, partición por cuantiles): {_pc1_var:.4f}  ({_pc1_var*100:.2f}%)")
+    print(f"\nVariance explained by the 1st principal component "
+          f"(PCA, quantile partitioning): {_pc1_var:.4f}  ({_pc1_var*100:.2f}%)")
 
 ahn.fit_platt(X_val, y_val)
-print(f"Platt Scaling ajustado:  a={ahn.platt_a:.4f}  b={ahn.platt_b:.4f}")
+print(f"Platt Scaling fitted:  a={ahn.platt_a:.4f}  b={ahn.platt_b:.4f}")
 
 y_pred_ahn  = ahn.predict(X_test)
 y_proba_ahn = ahn.predict_proba(X_test)[:, 1]
@@ -706,7 +778,12 @@ print(f"\nAHN: Acc={ahn_results['test_acc']:.4f}, "
 
 from sklearn.model_selection import StratifiedKFold
 
-K_FOLDS  = 3
+K_FOLDS  = 10   # Kohavi (1995): 10-fold stratified CV is the standard recommendation
+                 # for accuracy estimation "even if computation power allows using
+                 # more folds." Our train+val union (~5,860 rows on real KOI data)
+                 # is well past the n>1000 threshold where 10-fold is standard
+                 # practice (vs. 5-fold for smaller datasets), and comfortably
+                 # affordable computationally.
 kf       = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
 X_cv     = np.vstack([X_train, X_val])   # usamos todo lo que no es test
 y_cv     = np.concatenate([y_train, y_val])
@@ -716,9 +793,9 @@ _CV_METRICS = ['auc', 'ap', 'acc', 'f1']   # must match the printed header order
 cv_scores   = {m: {met: [] for met in _CV_METRICS} for m in _CV_MODELS}
 
 print(f"\n{'─'*78}")
-print(f"K-FOLD CROSS VALIDATION  (K={K_FOLDS}, StratifiedKFold, datos=train+val, 4 modelos)")
+print(f"K-FOLD CROSS VALIDATION  (K={K_FOLDS}, StratifiedKFold, data=train+val, 4 models)")
 print(f"{'─'*78}")
-print(f"  {'Fold':>5}  {'Modelo':<16}  {'AUC':>7}  {'AUC-PR':>7}  {'ACC':>7}  {'F1':>7}")
+print(f"  {'Fold':>5}  {'Model':<16}  {'AUC':>7}  {'AUC-PR':>7}  {'ACC':>7}  {'F1':>7}")
 
 for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cv, y_cv), 1):
     X_tr, X_ho = X_cv[tr_idx], X_cv[val_idx]
@@ -756,14 +833,14 @@ for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cv, y_cv), 1):
         print(f"  {fold:>5}  {name:<16}  {s['auc']:.4f}   {s['ap']:.4f}   {s['acc']:.4f}   {s['f1']:.4f}")
 
 print(f"{'─'*78}")
-print(f"  {'Modelo':<16}  {'AUC':>15}  {'AUC-PR':>15}  {'ACC':>15}  {'F1':>15}")
+print(f"  {'Model':<16}  {'AUC':>15}  {'AUC-PR':>15}  {'ACC':>15}  {'F1':>15}")
 for name in _CV_MODELS:
     row = f"  {name:<16}"
     for met in _CV_METRICS:
         vals = cv_scores[name][met]
         row += f"  {np.mean(vals):.4f}±{np.std(vals):.4f}"
     print(row)
-print(f"\n  [Test real AHN final: "
+print(f"\n  [Actual AHN test: "
       f"AUC={ahn_results['roc_auc']:.4f}  "
       f"AUC-PR={ahn_results['avg_precision']:.4f}  "
       f"ACC={ahn_results['test_acc']:.4f}  "
@@ -774,7 +851,7 @@ pd.DataFrame([
     for name in _CV_MODELS for met in _CV_METRICS
     for i, v in enumerate(cv_scores[name][met])
 ]).to_csv(out('cv_results_all_models.csv'), index=False)
-print("  Guardado: cv_results_all_models.csv")
+print("  Saved: cv_results_all_models.csv")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -782,7 +859,7 @@ print("  Guardado: cv_results_all_models.csv")
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 70)
-print("Entrenando modelos baseline...")
+print("Training baseline models...")
 print("=" * 70)
 
 baseline_models       = make_baselines(seed=42)
@@ -825,7 +902,7 @@ for name, model in baseline_models.items():
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 70)
-print("TABLA COMPARATIVA COMPLETA")
+print("FULL COMPARISON TABLE")
 print("=" * 70)
 
 rows = []
@@ -834,13 +911,13 @@ for name, res in baseline_results.items():
                  'Train Acc': res['train_acc'], 'Val Acc': res['val_acc'],
                  'Test Acc':  res['test_acc'],  'Precision': res['precision'],
                  'Recall':    res['recall'],    'F1-Score':  res['f1'],
-                 'Avg Precision (AUC-PR)': res['avg_precision'],
+                 'AUC-PR': res['avg_precision'],
                  'ROC-AUC':   res['roc_auc']})
 rows.append({'Model': 'AHN', 'Type': 'AHN',
              'Train Acc': ahn_results['train_acc'], 'Val Acc': ahn_results['val_acc'],
              'Test Acc':  ahn_results['test_acc'],  'Precision': ahn_results['precision'],
              'Recall':    ahn_results['recall'],    'F1-Score':  ahn_results['f1'],
-             'Avg Precision (AUC-PR)': ahn_results['avg_precision'],
+             'AUC-PR': ahn_results['avg_precision'],
              'ROC-AUC':   ahn_results['roc_auc']})
 rows.append({'Model': 'All-Positive (Control)', 'Type': 'Control',
              'Train Acc': ALL_POSITIVE_CONTROL['train_acc'],
@@ -849,7 +926,7 @@ rows.append({'Model': 'All-Positive (Control)', 'Type': 'Control',
              'Precision': ALL_POSITIVE_CONTROL['precision'],
              'Recall':    ALL_POSITIVE_CONTROL['recall'],
              'F1-Score':  ALL_POSITIVE_CONTROL['f1'],
-             'Avg Precision (AUC-PR)': ALL_POSITIVE_CONTROL['ap'],
+             'AUC-PR': ALL_POSITIVE_CONTROL['ap'],
              'ROC-AUC':   ALL_POSITIVE_CONTROL['auc']})
 
 comparison_df = (pd.DataFrame(rows)
@@ -858,7 +935,7 @@ comparison_df = (pd.DataFrame(rows)
 
 print(comparison_df.drop(columns='Type').to_string(index=False))
 comparison_df.to_csv(out('final_comparison_table.csv'), index=False)
-print("\nTabla guardada: final_comparison_table.csv")
+print("\nTable saved: final_comparison_table.csv")
 
 # Classification reports
 print("\n" + "=" * 70)
@@ -874,7 +951,7 @@ for name, res in {'AHN': ahn_results, **baseline_results}.items():
 #  BLOQUE 6 — VISUALIZACIONES
 # ══════════════════════════════════════════════════════════════════════════════
 
-print("\nGenerando visualizaciones...")
+print("\nGenerating visualizations...")
 
 plt.style.use('seaborn-v0_8-darkgrid')
 colors_baseline = sns.color_palette("husl", len(baseline_results))
@@ -902,11 +979,11 @@ ax.set_xticklabels(categories, size=12)
 ax.set_ylim(0, 1)
 ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
 ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1), fontsize=10)
-plt.title('Radar Chart: Comparación de Todas las Métricas',
+plt.title('Radar Chart: Comparison of All Metrics',
           size=14, fontweight='bold', pad=20)
 plt.tight_layout()
 plt.savefig(out('final_radar_comparison.png'), dpi=300, bbox_inches='tight')
-print("  Guardado: final_radar_comparison.png")
+print("  Saved: final_radar_comparison.png")
 plt.close()
 
 # ── FIGURA 2: Curvas ROC ──────────────────────────────────────────────────────
@@ -929,12 +1006,12 @@ plt.legend(loc='lower right', fontsize=10, framealpha=0.95)
 plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig(out('final_roc_curves_complete.png'), dpi=300, bbox_inches='tight')
-print("  Guardado: final_roc_curves_complete.png")
+print("  Saved: final_roc_curves_complete.png")
 plt.close()
 
 # ── FIGURA 3: Barras comparativas ─────────────────────────────────────────────
 fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-fig.suptitle('Comparación Cuantitativa: AHN vs Baseline Models',
+fig.suptitle('Quantitative Comparison: AHN vs Baseline Models',
              fontsize=16, fontweight='bold')
 
 models_order = list(baseline_results.keys()) + ['AHN']
@@ -990,12 +1067,12 @@ ax.set_ylim([0, 1.05]); ax.legend(); ax.grid(axis='y', alpha=0.3)
 
 plt.tight_layout()
 plt.savefig(out('final_metrics_comparison.png'), dpi=300, bbox_inches='tight')
-print("  Guardado: final_metrics_comparison.png")
+print("  Saved: final_metrics_comparison.png")
 plt.close()
 
 # ── FIGURA 4: Matrices de confusion ──────────────────────────────────────────
 fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
-fig.suptitle('Matrices de Confusion — AHN vs Baseline  (NASA Exoplanets KOI)',
+fig.suptitle('Confusion Matrices — AHN vs Baseline  (NASA Exoplanets KOI)',
              fontsize=14, fontweight='bold')
 
 plot_items = [('AHN', ahn_results, color_ahn)] + \
@@ -1008,18 +1085,18 @@ for ax, (name, res, col) in zip(axes, plot_items):
     marker = '* ' if name == 'AHN' else ''
     ax.set_title(f'{marker}{name}\nAcc={res["test_acc"]:.4f}  F1={res["f1"]:.4f}',
                  fontsize=10, fontweight='bold', color=col)
-    ax.set_xlabel('Predicho')
-    ax.set_ylabel('Real' if name == 'AHN' else '')
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual' if name == 'AHN' else '')
 
 plt.tight_layout()
 plt.savefig(out('ahn_confusion_matrices.png'), dpi=300, bbox_inches='tight')
-print("  Guardado: ahn_confusion_matrices.png")
+print("  Saved: ahn_confusion_matrices.png")
 plt.close()
 
 # ── FIGURA 5: Convergencia AHN ────────────────────────────────────────────────
 comp = ahn.compounds[0]
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-fig.suptitle('Estructura Interna del Compuesto AHN', fontsize=13, fontweight='bold')
+fig.suptitle('Internal Structure of the AHN Compound', fontsize=13, fontweight='bold')
 
 ax = axes[0]
 assignments = comp._partition(X_train)
@@ -1032,8 +1109,8 @@ bars  = ax.bar([f'Mol {j+1}\n{mol_lbl[j]}' for j in range(comp.m)],
 for bar, n in zip(bars, counts):
     ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
             str(n), ha='center', fontweight='bold')
-ax.set_ylabel('Muestras asignadas (train)')
-ax.set_title(f'Particionamiento Sigma_j  (m={comp.m} moleculas)')
+ax.set_ylabel('Samples assigned (train)')
+ax.set_title(f'Sigma_j Partitioning  (m={comp.m} molecules)')
 
 ax = axes[1]
 hist = comp.history
@@ -1041,14 +1118,14 @@ ax.plot(range(1, len(hist)+1), hist, '-o', color=color_ahn, lw=2,
         markersize=5, label='E_global = sum(E_j)')
 ax.axhline(AHN_CONFIG['tolerance'], color='gray', ls='--', lw=1.5,
            label=f'eps = {AHN_CONFIG["tolerance"]}')
-ax.set_xlabel('Iteracion'); ax.set_ylabel('Error global')
-ax.set_title('Convergencia — Algoritmo 1')
+ax.set_xlabel('Iteration'); ax.set_ylabel('Global error')
+ax.set_title('Convergence — Algorithm 1')
 ax.legend()
 if min(hist) > 0:
     ax.set_yscale('log')
 plt.tight_layout()
 plt.savefig(out('ahn_internal_structure.png'), dpi=300, bbox_inches='tight')
-print("  Guardado: ahn_internal_structure.png")
+print("  Saved: ahn_internal_structure.png")
 plt.close()
 
 
@@ -1057,12 +1134,12 @@ plt.close()
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 70)
-print("ANALISIS ESTADISTICO")
+print("STATISTICAL ANALYSIS")
 print("=" * 70)
 
-print("\nRANKING POR METRICA:")
+print("\nRANKING BY METRIC:")
 print("-" * 70)
-for metric in ['Test Acc', 'F1-Score', 'Avg Precision (AUC-PR)', 'ROC-AUC']:
+for metric in ['Test Acc', 'F1-Score', 'AUC-PR', 'ROC-AUC']:
     ranked = comparison_df.sort_values(metric, ascending=False)
     print(f"\n{metric}:")
     for rank, (_, row) in enumerate(ranked.iterrows(), 1):
@@ -1079,9 +1156,9 @@ _real_df = comparison_df[comparison_df['Type'] != 'Control']
 best = _real_df.loc[_real_df['Overall Score'].idxmax()]
 
 print("\n" + "=" * 70)
-print("MEJOR MODELO GENERAL  (score = 0.3*Acc + 0.3*F1 + 0.4*AUC)")
+print("BEST OVERALL MODEL  (score = 0.3*Acc + 0.3*F1 + 0.4*AUC)")
 print("=" * 70)
-print(f"\n  Ganador  : {best['Model']}")
+print(f"\n  Winner   : {best['Model']}")
 print(f"  Overall  : {best['Overall Score']:.4f}")
 print(f"  Accuracy : {best['Test Acc']:.4f}")
 print(f"  F1-Score : {best['F1-Score']:.4f}")
@@ -1090,11 +1167,11 @@ print(f"  ROC-AUC  : {best['ROC-AUC']:.4f}")
 b_df  = comparison_df[comparison_df['Type'] == 'Baseline']
 b_acc = b_df['Test Acc'].mean()
 b_f1  = b_df['F1-Score'].mean()
-b_ap  = b_df['Avg Precision (AUC-PR)'].mean()
+b_ap  = b_df['AUC-PR'].mean()
 b_roc = b_df['ROC-AUC'].mean()
 
 print("\n" + "=" * 70)
-print("AHN vs BASELINE PROMEDIO")
+print("AHN vs BASELINE AVERAGE")
 print("=" * 70)
 
 print(f"\n  Accuracy : AHN {ahn_results['test_acc']:.4f}  vs  Baseline {b_acc:.4f}  "
@@ -1116,9 +1193,9 @@ with open(out('ahn_comparison_data.pkl'), 'wb') as f:
                  'comparison_df': comparison_df}, f)
 
 print("\n" + "=" * 70)
-print("ANALISIS COMPLETO FINALIZADO")
+print("FULL ANALYSIS FINISHED")
 print("=" * 70)
-print(f"\nArchivos generados en: {OUTPUT_DIR}")
+print(f"\nFiles generated in: {OUTPUT_DIR}")
 print("  1. final_comparison_table.csv")
 print("  2. final_radar_comparison.png")
 print("  3. final_roc_curves_complete.png")
@@ -1152,10 +1229,17 @@ _MLABELS = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'AUC-PR', 'ROC-AUC']
 # MLP en la Fig. 1 original no bastaba para concluir robustez con una corrida.
 ROBUSTNESS_SEEDS = [0, 1, 2, 3, 4]
 
-_AHN_SWEEP = {k: v for k, v in AHN_CONFIG.items()}
-_AHN_SWEEP['n_restarts']     = 1
-_AHN_SWEEP['max_iterations'] = 40
-_AHN_SWEEP['patience']       = 10
+# NOTA: una versión anterior de este script entrenaba AHN con un presupuesto
+# reducido (n_restarts=1, max_iterations=40, patience=10) específicamente en
+# los tres barridos de robustez, documentado solo en la sección de limitaciones
+# del paper. Eso introduce un confusor real: si AHN parte de un óptimo peor
+# solo en estos experimentos, cualquier "robustez" observada podría deberse a
+# que hay menos rendimiento que perder, no a una propiedad estructural del
+# modelo — exactamente el tipo de artefacto que un revisor escéptico señalaría.
+# Se eliminó esa reducción: AHN usa aquí la MISMA configuración completa que en
+# el experimento principal (AHN_CONFIG, sin modificar), igual que los tres
+# baselines nunca tuvieron su presupuesto de entrenamiento reducido en ningún
+# experimento.
 
 def _eval_all(X_tr, y_tr, X_te, y_te, seed=42):
     """Fits AHN + all three baselines with one shared seed (controls AHN's own
@@ -1164,7 +1248,7 @@ def _eval_all(X_tr, y_tr, X_te, y_te, seed=42):
     results = {}
     _rng = np.random.default_rng(seed)
 
-    cfg = {**_AHN_SWEEP, 'random_state': seed}
+    cfg = {**AHN_CONFIG, 'random_state': seed}
     _ahn = AHNMixture(**cfg)
     _ahn.fit(X_tr, y_tr, verbose=False)
     _ahn.fit_platt(X_val, y_val)          # calibrated on the fixed validation set
@@ -1208,34 +1292,67 @@ def _aggregate(df_raw, x_col):
 
 def _plot_robustness(x_vals, agg_df, x_col, x_labels, xlabel, title, fname,
                      highlight_ref=None):
-    """Plots mean ± std (error bars) across ROBUSTNESS_SEEDS for each metric."""
-    fig, axes = plt.subplots(1, 6, figsize=(26, 5))
-    fig.suptitle(f"{title}  (media ± std, {len(ROBUSTNESS_SEEDS)} semillas)",
-                 fontsize=12, fontweight='bold', y=1.02)
+    """Plots mean ± std (error bars) across ROBUSTNESS_SEEDS for each metric,
+    styled to match the paper's existing Figs. 1-3 (white background, light
+    gridlines, serif font) rather than the darkgrid style used by the
+    diagnostic-only plots elsewhere in this script — scoped locally via
+    plt.style.context so it doesn't affect anything else.
 
-    for ax, met, mlbl in zip(axes, _METRICS, _MLABELS):
-        for m in _MODELS:
-            sub = agg_df[agg_df.model == m].set_index(x_col).loc[x_vals]
-            means = sub[f'{met}_mean'].values
-            stds  = sub[f'{met}_std'].values
-            ax.errorbar(range(len(x_vals)), means, yerr=stds, capsize=3,
-                        marker=_MARKERS[m], color=_PALETTE[m],
-                        lw=_LW[m], markersize=7, label=m, alpha=0.9)
-        if highlight_ref is not None:
-            ax.axvline(highlight_ref, color='gray', lw=1.2, ls='--',
-                       alpha=0.6, label='Ref. limpia')
-        ax.set_xticks(range(len(x_vals)))
-        ax.set_xticklabels(x_labels, fontsize=8, rotation=30, ha='right')
-        ax.set_xlabel(xlabel, fontsize=9)
-        ax.set_ylabel(mlbl, fontsize=9)
-        ax.set_title(mlbl, fontsize=10, fontweight='bold')
-        ax.set_ylim([0.0, 1.05])
-        ax.legend(fontsize=8)
-        ax.grid(axis='y', alpha=0.3)
+    Font sizes are calibrated for the PRINTED size, not the on-screen size:
+    this figure is natively ~24in wide, but a paper will scale it down to
+    roughly 7in (double-column width) — a ~3.5x shrink. No title is baked
+    into the image — it prints to console for the LaTeX \\caption{} instead,
+    since a redundant in-image title just eats space a reader has to squint
+    past to reach the panels. Only one shared y-axis label ('Score') is
+    shown, on the leftmost panel — repeating it on all six panels was
+    redundant with the panel titles directly above each one and stole space
+    that's better spent making the titles themselves bigger.
+    """
+    print(f"  Figure caption reference: {title}  (mean ± std, {len(ROBUSTNESS_SEEDS)} seeds)")
 
-    plt.tight_layout()
-    plt.savefig(out(fname), dpi=300, bbox_inches='tight')
-    print(f"  Guardado: {fname}")
+    with plt.style.context('seaborn-v0_8-whitegrid'):
+        plt.rcParams['font.family'] = 'serif'
+        fig, axes = plt.subplots(1, 6, figsize=(24, 4.8), sharey=True)
+
+        handles, labels = None, None
+        for i, (ax, met, mlbl) in enumerate(zip(axes, _METRICS, _MLABELS)):
+            for m in _MODELS:
+                sub = agg_df[agg_df.model == m].set_index(x_col).loc[x_vals]
+                means = sub[f'{met}_mean'].values
+                stds  = sub[f'{met}_std'].values
+                xs    = range(len(x_vals))
+                # Error bars first, at a higher z-order, so caps always show
+                # even when std is tiny — otherwise the marker (drawn on top
+                # in a single errorbar() call) can fully hide a short cap,
+                # which is exactly what happened under Label Noise, where
+                # std is often smaller than the marker's own radius.
+                ax.errorbar(xs, means, yerr=stds, fmt='none', ecolor=_PALETTE[m],
+                            capsize=5, elinewidth=1.6, capthick=1.6,
+                            alpha=0.9, zorder=5)
+                ax.plot(xs, means, marker=_MARKERS[m], color=_PALETTE[m],
+                        lw=_LW[m], markersize=7, label=m, alpha=0.9, zorder=3)
+            if highlight_ref is not None:
+                ax.axvline(highlight_ref, color='gray', lw=1.3, ls='--',
+                           alpha=0.6, label='Clean ref.')
+            if handles is None:
+                handles, labels = ax.get_legend_handles_labels()   # collect once, shared legend below
+            ax.set_xticks(range(len(x_vals)))
+            _rot = 0 if any('\n' in lbl for lbl in x_labels) else 30
+            ax.set_xticklabels(x_labels, fontsize=12, rotation=_rot,
+                               ha=('center' if _rot == 0 else 'right'))
+            ax.set_title(mlbl, fontsize=22, fontweight='bold', pad=10)
+            ax.set_ylim([0.0, 1.05])
+            ax.tick_params(axis='y', labelsize=14, labelleft=(i == 0))
+            ax.grid(axis='y', alpha=0.3)
+
+        axes[0].set_ylabel('Score', fontsize=18)
+        fig.text(0.5, -0.02, xlabel, ha='center', fontsize=16)
+
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.10),
+                   ncol=len(labels), fontsize=17, frameon=False, columnspacing=1.8)
+        plt.tight_layout(rect=[0, 0.02, 1, 0.92])
+        plt.savefig(out(fname), dpi=300, bbox_inches='tight')
+    print(f"  Saved: {fname}")
     plt.close()
 
 def _print_table(x_vals, x_col_label, agg_df, x_labels, x_col):
@@ -1259,11 +1376,11 @@ def _print_table(x_vals, x_col_label, agg_df, x_labels, x_col):
 SCARCITY_FRACTIONS = [0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00]
 
 print("\n" + "=" * 70)
-print("EXP 1 — DATA SCARCITY  [Exoplanetas KOI]")
+print("EXP 1 — DATA SCARCITY  [Exoplanets KOI]")
 print("=" * 70)
-print("  Submuestreo estratificado de X_train  |  X_val, X_test fijos")
-print(f"  Fracciones: {[f'{f:.0%}' for f in SCARCITY_FRACTIONS]}")
-print(f"  Semillas: {ROBUSTNESS_SEEDS}  (media ± std sobre {len(ROBUSTNESS_SEEDS)} corridas)\n")
+print("  Stratified subsampling of X_train  |  X_val, X_test fixed")
+print(f"  Fractions: {[f'{f:.0%}' for f in SCARCITY_FRACTIONS]}")
+print(f"  Seeds: {ROBUSTNESS_SEEDS}  (mean ± std over {len(ROBUSTNESS_SEEDS)} runs)\n")
 
 sc_rows  = []
 sc_sizes = {}
@@ -1297,13 +1414,14 @@ _print_table(SCARCITY_FRACTIONS, 'frac', sc_df,
 
 _plot_robustness(
     SCARCITY_FRACTIONS, sc_df, 'fraction',
-    [f"{f:.0%}\n(n={sc_sizes[f]})" for f in SCARCITY_FRACTIONS],
-    'Fracción del train set',
-    'EXP 1 — Data Scarcity [Exoplanetas]: Métricas según tamaño del train set',
+    [f"{f:.0%}" for f in SCARCITY_FRACTIONS],
+    'Training set fraction',
+    f'EXP 1 — Data Scarcity [Exoplanets]: Metrics vs. training set size '
+    f'(n={sc_sizes[0.05]} at 5% to n={sc_sizes[1.00]} at 100%)',
     'robustness_scarcity.png',
     highlight_ref=len(SCARCITY_FRACTIONS) - 1,
 )
-print("  Guardado: robustness_scarcity.csv (agregado)  /  robustness_scarcity_raw.csv (por semilla)")
+print("  Saved: robustness_scarcity.csv (aggregated)  /  robustness_scarcity_raw.csv (per seed)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1313,11 +1431,11 @@ print("  Guardado: robustness_scarcity.csv (agregado)  /  robustness_scarcity_ra
 NOISE_SIGMAS = [0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
 
 print("\n" + "=" * 70)
-print("EXP 2 — FEATURE NOISE  [Exoplanetas KOI]")
+print("EXP 2 — FEATURE NOISE  [Exoplanets KOI]")
 print("=" * 70)
-print("  Entrenar con X_train limpio  |  Ruido N(0,σ) añadido a X_test")
-print(f"  σ: {NOISE_SIGMAS}  (escala escalada [-1,1])")
-print(f"  Semillas: {ROBUSTNESS_SEEDS}  (media ± std sobre {len(ROBUSTNESS_SEEDS)} corridas)\n")
+print("  Train on clean X_train  |  Noise N(0,σ) added to X_test")
+print(f"  σ: {NOISE_SIGMAS}  (scaled range [-1,1])")
+print(f"  Seeds: {ROBUSTNESS_SEEDS}  (mean ± std over {len(ROBUSTNESS_SEEDS)} runs)\n")
 
 fn_rows = []
 
@@ -1327,7 +1445,7 @@ for seed in ROBUSTNESS_SEEDS:
     # ahora sobre varias semillas para poder reportar media ± std.
     _rng = np.random.default_rng(seed)
 
-    cfg_fn = {**_AHN_SWEEP, 'random_state': seed}
+    cfg_fn = {**AHN_CONFIG, 'random_state': seed}
     _ahn_fn = AHNMixture(**cfg_fn)
     _ahn_fn.fit(X_train, y_train, verbose=False)
     _ahn_fn.fit_platt(X_val, y_val)
@@ -1378,12 +1496,135 @@ _print_table(NOISE_SIGMAS, 'σ', fn_df, [f"σ={s}" for s in NOISE_SIGMAS], 'sigm
 _plot_robustness(
     NOISE_SIGMAS, fn_df, 'sigma',
     [f"σ={s}" for s in NOISE_SIGMAS],
-    'σ ruido Gaussiano (escala [-1,1])',
-    'EXP 2 — Feature Noise [Exoplanetas]: Métricas con ruido creciente en inferencia',
+    'σ Gaussian noise (scale [-1,1])',
+    'EXP 2 — Feature Noise [Exoplanets]: Metrics under increasing noise at inference',
     'robustness_feature_noise.png',
     highlight_ref=0,
 )
-print("  Guardado: robustness_feature_noise.csv (agregado)  /  robustness_feature_noise_raw.csv (por semilla)")
+print("  Saved: robustness_feature_noise.csv (aggregated)  /  robustness_feature_noise_raw.csv (per seed)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BLOQUE 10b — EXP 2b: FEATURE NOISE (MUESTREADO DESDE INCERTIDUMBRE REAL)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Reviewer #1 (punto de menor prioridad, no bloqueante): "the KOI table
+# publishes per-object error columns. Sampling from those instead of a flat
+# sigma would make the noise scenario a physical one."
+#
+# Diferencia frente al Exp. 2 (Bloque 10) — ver también RESUMEN DEL DATASET:
+#   Exp. 2  (sigma plano):  ruido = N(0, sigma), IDÉNTICO para las 10 features
+#                           y para todos los objetos del test set. sigma=1.0
+#                           es "una unidad del rango escalado [-1,1]" — una
+#                           cantidad arbitraria, sin relación con qué tan bien
+#                           se midió cada parámetro para cada candidato.
+#   Exp. 2b (físico):       ruido = N(0, sigma * U_ij), donde U_ij es la
+#                           incertidumbre de medición REAL reportada por el
+#                           pipeline de Kepler para el objeto i y la feature j
+#                           (promedio de |err1| y |err2|, columnas publicadas
+#                           por el NASA Exoplanet Archive), convertida al mismo
+#                           espacio escalado [-1,1]. sigma sigue siendo el
+#                           multiplicador de severidad (mismos valores de
+#                           barrido que en Exp. 2, para comparabilidad directa
+#                           del eje x), pero ahora la magnitud relativa del
+#                           ruido entre features y entre objetos refleja qué
+#                           tan bien fue medido cada uno, en vez de ser
+#                           uniforme: un candidato con koi_period muy preciso
+#                           recibe poco ruido en esa feature; uno con
+#                           koi_depth mal determinado recibe más.
+#   Para features sin columnas de error disponibles en este pull del archivo,
+#   Exp. 2b recae automáticamente en el mismo ruido plano que Exp. 2 SOLO para
+#   esa feature — nunca se inventa una incertidumbre. Con datos sintéticos
+#   (sin columnas reales), Exp. 2b es idéntico a Exp. 2 por construcción.
+
+print("\n" + "=" * 70)
+print("EXP 2b — FEATURE NOISE (SAMPLED FROM REAL PER-OBJECT UNCERTAINTY)  [Exoplanets KOI]")
+print("=" * 70)
+if U_raw_all is not None:
+    print(f"  Real uncertainty available for {sum(_feat_has_err_cols.values())}/{len(FEATURES)} features "
+          f"(remaining features use flat sigma — see DATASET SUMMARY above)")
+else:
+    print(f"  ⚠  No real uncertainty columns available (source = {DATA_SOURCE}) — "
+          f"this experiment is identical to Exp. 2 with this data source")
+print(f"  σ (severity multiplier): {NOISE_SIGMAS}")
+print(f"  Seeds: {ROBUSTNESS_SEEDS}  (mean ± std over {len(ROBUSTNESS_SEEDS)} runs)\n")
+
+fn2_rows = []
+
+for seed in ROBUSTNESS_SEEDS:
+    cfg_fn2 = {**AHN_CONFIG, 'random_state': seed}
+    _ahn_fn2 = AHNMixture(**cfg_fn2)
+    _ahn_fn2.fit(X_train, y_train, verbose=False)
+    _ahn_fn2.fit_platt(X_val, y_val)
+
+    _bl_fn2   = {}
+    _rng_fit2 = np.random.default_rng(seed)
+    for name, model in make_baselines(seed).items():
+        fit_baseline(name, model, X_train, y_train, _rng_fit2)
+        _bl_fn2[name] = CalibratedBaseline(model).fit_platt(X_val, y_val)
+
+    _rng_noise2 = np.random.default_rng(3000 + seed)
+    for sigma in NOISE_SIGMAS:
+        noise    = _rng_noise2.normal(0, 1, X_test.shape) * sigma * U_test_scaled if sigma > 0 else 0
+        X_te_n2  = X_test + noise
+
+        yp  = _ahn_fn2.predict(X_te_n2)
+        ypr = _ahn_fn2.predict_proba(X_te_n2)[:, 1]
+        fn2_rows.append({'model': 'AHN', 'sigma': sigma, 'seed': seed,
+            'acc':       accuracy_score(y_test, yp),
+            'precision': precision_score(y_test, yp, zero_division=0),
+            'recall':    recall_score(y_test, yp, zero_division=0),
+            'f1':        f1_score(y_test, yp, zero_division=0),
+            'ap':        average_precision_score(y_test, ypr),
+            'auc':       roc_auc_score(y_test, ypr),
+        })
+        for name, cal in _bl_fn2.items():
+            yp  = cal.predict(X_te_n2)
+            ypr = cal.predict_proba(X_te_n2)[:, 1]
+            fn2_rows.append({'model': name, 'sigma': sigma, 'seed': seed,
+                'acc':       accuracy_score(y_test, yp),
+                'precision': precision_score(y_test, yp, zero_division=0),
+                'recall':    recall_score(y_test, yp, zero_division=0),
+                'f1':        f1_score(y_test, yp, zero_division=0),
+                'ap':        average_precision_score(y_test, ypr),
+                'auc':       roc_auc_score(y_test, ypr),
+            })
+
+    mean_auc0 = {m: np.mean([r['auc'] for r in fn2_rows
+                              if r['sigma'] == 0.0 and r['seed'] == seed and r['model'] == m])
+                 for m in _MODELS}
+    print(f"  seed={seed}  σ=0.00  |  " + "  ".join(f"{m} AUC={mean_auc0[m]:.3f}" for m in _MODELS))
+
+fn2_raw_df = pd.DataFrame(fn2_rows)
+fn2_raw_df.to_csv(out('robustness_feature_noise_physical_raw.csv'), index=False)
+fn2_df = _aggregate(fn2_raw_df, 'sigma')
+fn2_df.to_csv(out('robustness_feature_noise_physical.csv'), index=False)
+
+_print_table(NOISE_SIGMAS, 'σ', fn2_df, [f"σ={s}" for s in NOISE_SIGMAS], 'sigma')
+
+_plot_robustness(
+    NOISE_SIGMAS, fn2_df, 'sigma',
+    [f"σ={s}" for s in NOISE_SIGMAS],
+    'σ (multiplier over real per-object uncertainty)',
+    'EXP 2b — Feature Noise (physical) [Exoplanets]: noise sampled from real measurement uncertainty',
+    'robustness_feature_noise_physical.png',
+    highlight_ref=0,
+)
+print("  Saved: robustness_feature_noise_physical.csv (aggregated)  /  robustness_feature_noise_physical_raw.csv (per seed)")
+
+# ── Comparación directa: Exp. 2 (sigma plano) vs Exp. 2b (físico) ───────────
+def _lookup(df, m, met, val):
+    return df[(df.model == m) & (df.sigma == val)][f'{met}_mean'].values[0]
+
+print(f"\n  Comparison at σ=1.0 (most severe point of the sweep)")
+print(f"  {'Model':<16}  {'F1 flat':>9}  {'F1 physical':>10}  {'AUC-PR flat':>13}  {'AUC-PR physical':>14}")
+print("  " + "-" * 72)
+for m in _MODELS:
+    f1_plano  = _lookup(fn_df,  m, 'f1', 1.0)
+    f1_fisico = _lookup(fn2_df, m, 'f1', 1.0)
+    ap_plano  = _lookup(fn_df,  m, 'ap', 1.0)
+    ap_fisico = _lookup(fn2_df, m, 'ap', 1.0)
+    print(f"  {m:<16}  {f1_plano:>9.4f}  {f1_fisico:>10.4f}  {ap_plano:>13.4f}  {ap_fisico:>14.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1393,11 +1634,11 @@ print("  Guardado: robustness_feature_noise.csv (agregado)  /  robustness_featur
 FLIP_RATES = [0.00, 0.05, 0.10, 0.15, 0.20]
 
 print("\n" + "=" * 70)
-print("EXP 3 — LABEL NOISE  [Exoplanetas KOI]")
+print("EXP 3 — LABEL NOISE  [Exoplanets KOI]")
 print("=" * 70)
-print("  Flip aleatorio de p% de y_train  |  y_test siempre limpio")
-print(f"  Tasas: {[f'{p:.0%}' for p in FLIP_RATES]}")
-print(f"  Semillas: {ROBUSTNESS_SEEDS}  (media ± std sobre {len(ROBUSTNESS_SEEDS)} corridas)\n")
+print("  Random flip of p% of y_train  |  y_test always clean")
+print(f"  Rates: {[f'{p:.0%}' for p in FLIP_RATES]}")
+print(f"  Seeds: {ROBUSTNESS_SEEDS}  (mean ± std over {len(ROBUSTNESS_SEEDS)} runs)\n")
 
 ln_rows = []
 
@@ -1426,12 +1667,12 @@ _print_table(FLIP_RATES, 'flip', ln_df, [f"{p:.0%}" for p in FLIP_RATES], 'flip_
 _plot_robustness(
     FLIP_RATES, ln_df, 'flip_rate',
     [f"{p:.0%}" for p in FLIP_RATES],
-    'Tasa de flip de etiquetas (train)',
-    'EXP 3 — Label Noise [Exoplanetas]: Métricas con etiquetas de entrenamiento corruptas',
+    'Label flip rate (train)',
+    'EXP 3 — Label Noise [Exoplanets]: Metrics under corrupted training labels',
     'robustness_label_noise.png',
     highlight_ref=0,
 )
-print("  Guardado: robustness_label_noise.csv (agregado)  /  robustness_label_noise_raw.csv (por semilla)")
+print("  Saved: robustness_label_noise.csv (aggregated)  /  robustness_label_noise_raw.csv (per seed)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1439,7 +1680,7 @@ print("  Guardado: robustness_label_noise.csv (agregado)  /  robustness_label_no
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 70)
-print("RESUMEN DE ROBUSTEZ — Caída de AUC (condición limpia → más extrema)")
+print("ROBUSTNESS SUMMARY — AUC drop (clean condition → most extreme)")
 print("=" * 70)
 
 def _get(df, m, met, x_col, x_val):
@@ -1448,8 +1689,8 @@ def _get(df, m, met, x_col, x_val):
 def _get_std(df, m, met, x_col, x_val):
     return df[(df.model == m) & (df[x_col] == x_val)][f'{met}_std'].values[0]
 
-print(f"\n  {'Experimento':<24}  {'Modelo':<16}  {'AUC limpio':>10}  {'AUC extremo (±std semillas)':>28}  {'ΔAUC':>7}"
-      f"  {'AP limpio':>9}  {'AP extremo (±std semillas)':>27}  {'ΔAP':>7}")
+print(f"\n  {'Experiment':<24}  {'Model':<16}  {'Clean AUC':>10}  {'Extreme AUC (±seed std)':>28}  {'ΔAUC':>7}"
+      f"  {'Clean AP':>9}  {'Extreme AP (±seed std)':>27}  {'ΔAP':>7}")
 print("  " + "-" * 130)
 
 for m in _MODELS:
@@ -1485,9 +1726,9 @@ for m in _MODELS:
           f"  {p_c:>9.4f}  {p_e:.4f} ± {p_e_std:<19.4f}  {p_e-p_c:>+7.4f}")
 
 print("\n" + "=" * 70)
-print("EXPERIMENTOS DE ROBUSTEZ FINALIZADOS  [Exoplanetas KOI]")
+print("ROBUSTNESS EXPERIMENTS FINISHED  [Exoplanets KOI]")
 print("=" * 70)
-print(f"\nArchivos adicionales en: {OUTPUT_DIR}")
+print(f"\nAdditional files in: {OUTPUT_DIR}")
 print("   8. robustness_scarcity.png  / robustness_scarcity.csv")
 print("   9. robustness_feature_noise.png  / robustness_feature_noise.csv")
 print("  10. robustness_label_noise.png  / robustness_label_noise.csv")
